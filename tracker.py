@@ -139,23 +139,28 @@ class PickleVisionTracker:
         return float(distance)
 
     def _detect_ball_contact(self, track_points):
-        """Very lightweight placeholder for bounce/landing estimation.
-        For the draft, we detect when the ball direction changes sharply or the speed drops.
+        """Detects a bounce by looking for a V-shape change in the Y-axis.
+        
+        Physics: A true court bounce is defined by the ball moving downward (increasing Y)
+        then suddenly moving upward (decreasing Y). X-axis changes are ignored because they
+        represent spin, curvature, or lateral movement, not bounces.
         """
         if len(track_points) < 5:
             return None
 
         recent = track_points[-5:]
-        x_vals = [p[0] for p in recent]
         y_vals = [p[1] for p in recent]
 
-        dx = np.diff(x_vals)
+        # Calculate the change in Y (dy)
         dy = np.diff(y_vals)
 
-        direction_change = np.sum(np.sign(dx[:-1]) != np.sign(dx[1:])) > 0 or np.sum(np.sign(dy[:-1]) != np.sign(dy[1:])) > 0
+        # If the ball was going down (+dy) and suddenly goes up (-dy), it bounced
+        direction_change_y = np.sum(np.sign(dy[:-1]) != np.sign(dy[1:])) > 0
+
+        # Speed drop is a fallback for when a ball rolls or loses momentum near the boundary
         speed_drop = self._estimate_velocity(recent) < 4.0
 
-        if direction_change or speed_drop:
+        if direction_change_y or speed_drop:
             return recent[-1]
 
         return None
