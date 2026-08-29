@@ -263,11 +263,15 @@ class PickleVisionTracker:
 
         # Configure USB camera for high-speed capture (ELP 120fps camera optimization)
         if isinstance(video_source, int):  # USB camera device
+            # CRITICAL: Force MJPEG codec to achieve 120fps over USB 2.0
+            # Without this, raw YUY2 format will throttle to 5-10fps due to bandwidth limits
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
             cap.set(cv2.CAP_PROP_FPS, self.target_fps)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
-            print(f"[Camera Config] Requesting {self.target_width}x{self.target_height} @ {self.target_fps}fps")
+            print(f"[Camera Config] Requesting {self.target_width}x{self.target_height} @ {self.target_fps}fps (MJPEG)")
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
