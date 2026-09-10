@@ -259,8 +259,20 @@ class PickleVisionTracker:
         return frame
 
     def run_video(self, source, output_path=None, show_window=True):
-        source_path = Path(source)
-        video_source = str(source_path) if source_path.exists() else str(source)
+        if isinstance(source, Path):
+            video_source = str(source)
+        elif isinstance(source, int):
+            video_source = source
+        elif isinstance(source, str):
+            source_path = Path(source)
+            if source_path.exists():
+                video_source = str(source_path)
+            elif source.isdigit():
+                video_source = int(source)
+            else:
+                video_source = source
+        else:
+            raise TypeError(f"Unsupported source type: {type(source)}")
 
         cap = cv2.VideoCapture(video_source)
         if not cap.isOpened():
@@ -271,7 +283,7 @@ class PickleVisionTracker:
             # CRITICAL: Force MJPEG codec to achieve 120fps over USB 2.0
             # Without this, raw YUY2 format will throttle to 5-10fps due to bandwidth limits
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            
+
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
             cap.set(cv2.CAP_PROP_FPS, self.target_fps)
@@ -353,7 +365,7 @@ def main():
     )
 
     source = args.source
-    if not Path(source).exists() and source.isdigit():
+    if isinstance(source, str) and source.isdigit():
         source = int(source)
 
     events = tracker.run_video(source=source, output_path=args.output, show_window=args.show)
