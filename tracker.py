@@ -6,7 +6,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import supervision as sv
+from inference import get_model
+from inference_sdk import InferenceHTTPClient
+
+try:
+    from ultralytics import YOLO
+except ModuleNotFoundError:
+    YOLO = None
 
 
 @dataclass
@@ -105,6 +112,12 @@ class PickleVisionTracker:
         target_width: int = 1920,
         target_height: int = 1080,
     ) -> None:
+        if YOLO is None:
+            raise RuntimeError(
+                "Ultralytics is not installed in this environment. "
+                "Install it with: pip install ultralytics"
+            )
+
         self.model = YOLO(model_name)
         if device:
             self.model.to(device)
@@ -276,7 +289,19 @@ class PickleVisionTracker:
 
         cap = cv2.VideoCapture(video_source)
         if not cap.isOpened():
-            raise FileNotFoundError(f"Unable to open source: {source}")
+            if isinstance(video_source, int):
+                candidates = [idx for idx in range(0, 6) if idx != video_source]
+                for idx in candidates:
+                    print(f"[Camera Fallback] Source {video_source} failed; trying camera index {idx} instead.")
+                    cap = cv2.VideoCapture(idx)
+                    if cap.isOpened():
+                        video_source = idx
+                        print(f"[Camera Fallback] Successfully opened camera index {idx}.")
+                        break
+                if not cap.isOpened():
+                    raise FileNotFoundError(f"Unable to open source: {source}")
+            else:
+                raise FileNotFoundError(f"Unable to open source: {source}")
 
         # Configure USB camera for high-speed capture (ELP 120fps camera optimization)
         if isinstance(video_source, int):  # USB camera device
@@ -333,18 +358,99 @@ class PickleVisionTracker:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Project PickleVision: single-camera YOLOv8 tracking prototype for ELP 120fps USB camera")
-    parser.add_argument("--source", type=str, default="0", help="Video file path or USB camera index (default: 0 for ELP camera)")
+    parser.add_argument("--source", type=str, default="0", help="Video file path or USB camera index (default: 0)")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLOv8 model to load")
     parser.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tracking configuration")
     parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for NMS")
     parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path")
     parser.add_argument("--show", action="store_true", default=True, help="Display annotated frames in real-time")
-    parser.add_argument("--fps", type=int, default=120, help="Target camera FPS (default: 120 for ELP camera)")
-    parser.add_argument("--width", type=int, default=1920, help="Target camera width in pixels")
-    parser.add_argument("--height", type=int, default=1080, help="Target camera height in pixels")
+    parser.add_argument("--fps", type=int, default=30, help="Target camera FPS (default: 30; use 120 for ELP camera)")
+    parser.add_argument("--width", type=int, default=640, help="Target camera width in pixels (default: 640; use 1920 for ELP camera)")
+    parser.add_argument("--height", type=int, default=480, help="Target camera height in pixels (default: 480; use 1080 for ELP camera)")
     parser.add_argument("--court-corners", type=str, default=None, help="Court calibration: x1 y1 x2 y2 x3 y3 x4 y4 (TL TR BR BL)")
     return parser.parse_args()
+
+
+def run_local_inference_example(model_id: str = "your-model-id", image_path: str = "path/to/image.jpg"):
+    """Example Roboflow local inference call using the inference package."""
+    model = get_model(model_id=model_id)
+    results = model.infer(image_path)
+    print(results)
+    return results
+
+
+def run_supervision_visualization_example(model_id: str = "rfdetr-medium", image_url: str = "https://media.roboflow.com/inference/people-walking.jpg"):
+    """Example Roboflow inference + supervision visualization."""
+    image = sv.load_image_from_url(image_url)
+
+    model = get_model(model_id=model_id)
+    results = model.infer(image)[0]
+
+    detections = sv.Detections.from_inference(results)
+
+    annotated_image = sv.BoxAnnotator().annotate(scene=image, detections=detections)
+    annotated_image = sv.LabelAnnotator().annotate(scene=annotated_image, detections=detections)
+
+    sv.plot_image(annotated_image)
+    return annotated_image
+
+
+def run_elp_self_hosted_inference(
+    camera_index: int = 0,
+    api_url: str = "http://localhost:9001",
+    api_key: str = "ZceKVfYE1Cvm0jqDdA1F",
+    workspace_name: str = "franzs-workspace-utuz0",
+    workflow_id: str = "pickleball-prototype-vpickleball-prototype-1-yolo11n-t1-logic",
+    target_width: int = 1920,
+    target_height: int = 1080,
+    target_fps: int = 120,
+):
+    """Open the ELP USB camera and run each frame through a Roboflow Workflow deployment.
+
+    This targets a Roboflow *Workflow* (not a raw model), so it calls
+    `run_workflow(workspace_name, workflow_id, ...)` rather than `infer(model_id=...)`.
+    """
+    client = InferenceHTTPClient.init(
+        api_url=api_url,
+        api_key=api_key,
+    )
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {camera_index}")
+
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+    cap.set(cv2.CAP_PROP_FPS, target_fps)
+
+    print(f"[Camera] Opened index {camera_index}")
+    print(f"[Camera] Requested: {target_width}x{target_height} @ {target_fps}fps")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to read frame from camera.")
+                break
+
+            results = client.run_workflow(
+                workspace_name=workspace_name,
+                workflow_id=workflow_id,
+                images={"image": frame},
+            )
+            print(results)
+
+            cv2.imshow("ELP Camera + Roboflow", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    return None
 
 
 def main():
