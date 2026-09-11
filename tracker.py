@@ -530,6 +530,16 @@ class PickleVisionTracker:
                 (width, height),
             )
 
+        window_name = "Project PickleVision - Single Camera Draft"
+        if show_window:
+            # WINDOW_NORMAL makes it resizable/draggable; the initial size is just a
+            # display cap so a 1920x1080 capture doesn't overflow a laptop screen --
+            # recording and detection still use the full captured resolution.
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            display_width = min(width, 1280)
+            display_height = int(display_width * height / width) if width else height
+            cv2.resizeWindow(window_name, display_width, display_height)
+
         try:
             while cap.isOpened():
                 success, frame = cap.read()
@@ -542,7 +552,7 @@ class PickleVisionTracker:
                     writer.write(annotated)
 
                 if show_window:
-                    cv2.imshow("Project PickleVision - Single Camera Draft", annotated)
+                    cv2.imshow(window_name, annotated)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
         finally:
