@@ -1,0 +1,14 @@
+# torch/torchvision need the CUDA build for GPU inference (the plain PyPI wheel is CPU-only).
+# Install these two FIRST and separately:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Then install the rest of this file normally.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+opencv-python==4.12.0.88
+numpy==2.2.6
+supervision==0.29.1
+inference==1.5.2
+inference-sdk==1.5.2
+ultralytics==8.4.146
+lap==0.5.13
