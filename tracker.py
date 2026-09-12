@@ -627,8 +627,12 @@ class PickleVisionTracker:
         # would compress a longer real session into fewer frames than `fps` implies,
         # playing back sped-up/timelapsed. Duplicating the latest frame to catch up
         # to elapsed real time keeps recorded duration matching real duration.
+        # Capped per-iteration, or falling far enough behind (e.g. the requested fps
+        # is unrealistic for this camera/hardware) turns into a write-storm that
+        # falls further behind with every duplicate write, freezing the app.
         record_start = time.time()
         frames_written = 0
+        max_catchup_frames_per_iteration = max(1, int(fps))
 
         try:
             while cap.isOpened():
@@ -645,7 +649,8 @@ class PickleVisionTracker:
 
                 if writer is not None or raw_writer is not None:
                     expected_frames = int((time.time() - record_start) * fps)
-                    while frames_written <= expected_frames:
+                    catchup_target = min(expected_frames, frames_written + max_catchup_frames_per_iteration)
+                    while frames_written <= catchup_target:
                         if writer is not None:
                             writer.write(annotated)
                         if raw_writer is not None:
