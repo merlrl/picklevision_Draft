@@ -526,7 +526,7 @@ class PickleVisionTracker:
         self._draw_tracking(detect_frame, filtered_boxes, filtered_ids)
         return detect_frame
 
-    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None):
+    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None, record_fps=None):
         if isinstance(source, Path):
             video_source = str(source)
         elif isinstance(source, int):
@@ -575,6 +575,15 @@ class PickleVisionTracker:
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         print(f"[Camera Actual] {width}x{height} @ {fps}fps")
 
+        # Recording writes video-encode (CPU) work on top of detection (GPU) work --
+        # a high capture fps (120) is valuable for detection/motion-blur, but encoding
+        # two full-resolution streams at that same rate is real, sustained CPU cost
+        # that can starve the detection loop. Default the SAVED file to a lower fps
+        # than capture; every frame is still detected on, just not every one written.
+        effective_record_fps = record_fps if record_fps else min(fps, 30)
+        if (output_path or raw_output_path) and effective_record_fps < fps:
+            print(f"[Recording] Capturing/detecting at {fps}fps, writing video at {effective_record_fps}fps")
+
         if self.zoom_to_court and self.zoom_roi is None:
             self.zoom_roi = self._compute_zoom_roi(width, height)
 
@@ -591,7 +600,7 @@ class PickleVisionTracker:
             writer = cv2.VideoWriter(
                 str(output_path),
                 cv2.VideoWriter_fourcc(*"mp4v"),
-                fps,
+                effective_record_fps,
                 (output_width, output_height),
             )
 
@@ -606,7 +615,7 @@ class PickleVisionTracker:
             raw_writer = cv2.VideoWriter(
                 str(raw_output_path),
                 cv2.VideoWriter_fourcc(*"mp4v"),
-                fps,
+                effective_record_fps,
                 (width, height),
             )
             print(f"[Raw Recording] Saving unannotated footage to {raw_output_path} (Roboflow-ready)")
@@ -632,7 +641,7 @@ class PickleVisionTracker:
         # falls further behind with every duplicate write, freezing the app.
         record_start = time.time()
         frames_written = 0
-        max_catchup_frames_per_iteration = max(1, int(fps))
+        max_catchup_frames_per_iteration = max(1, int(effective_record_fps))
 
         try:
             while cap.isOpened():
@@ -648,7 +657,7 @@ class PickleVisionTracker:
                 annotated = self.process_frame(frame)
 
                 if writer is not None or raw_writer is not None:
-                    expected_frames = int((time.time() - record_start) * fps)
+                    expected_frames = int((time.time() - record_start) * effective_record_fps)
                     catchup_target = min(expected_frames, frames_written + max_catchup_frames_per_iteration)
                     while frames_written <= catchup_target:
                         if writer is not None:
@@ -682,6 +691,7 @@ def parse_args():
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for NMS")
     parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path (boxes/labels/trajectory baked in -- for review, not training)")
     parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training")
+    parser.add_argument("--record-fps", type=int, default=None, help="FPS to WRITE recorded video at (default: min(camera fps, 30)). Capture/detection still runs at full --fps; only the saved file rate is lowered, since encoding two full-res streams at 120fps is heavy CPU work")
     parser.add_argument("--show", action="store_true", default=True, help="Display annotated frames in real-time")
     parser.add_argument("--fps", type=int, default=30, help="Target camera FPS (default: 30; use 120 for ELP camera)")
     parser.add_argument("--width", type=int, default=640, help="Target camera width in pixels (default: 640; use 1920 for ELP camera)")
@@ -986,7 +996,13 @@ def main():
     )
     print(f"[Device] Running inference on: {tracker.device}")
 
-    events = tracker.run_video(source=source, output_path=args.output, show_window=args.show, raw_output_path=args.raw_output)
+    events = tracker.run_video(
+        source=source,
+        output_path=args.output,
+        show_window=args.show,
+        raw_output_path=args.raw_output,
+        record_fps=args.record_fps,
+    )
     print(f"\n[Summary] Tracked {len(events)} candidate ball events.")
 
 
