@@ -148,7 +148,7 @@ class PickleVisionTracker:
         max_match_distance: float = 250.0,
         ball_color_lower: tuple[int, int, int] = (25, 60, 60),
         ball_color_upper: tuple[int, int, int] = (45, 255, 255),
-        ball_color_min_ratio: float = 0.12,
+        ball_color_min_ratio: float = 0.35,
         require_ball_color: bool = True,
         camera_id: str = "cam0",
         zoom_to_court: bool = False,
@@ -526,6 +526,11 @@ class PickleVisionTracker:
         )
 
         predictions = result[0].get("predictions", {}).get("predictions", []) if result else []
+        # self.conf is applied here explicitly -- the workflow has its own
+        # internal threshold, but it's a separate setting configured in the
+        # Roboflow UI, not something this call controls, so low-confidence
+        # noise isn't otherwise guaranteed to be filtered out.
+        predictions = [p for p in predictions if p.get("confidence", 0.0) >= self.conf]
         if not predictions:
             return self._handle_missed_detection(detect_frame)
 
@@ -774,6 +779,7 @@ def parse_args():
     parser.add_argument("--max-missed-frames", type=int, default=15, help="Frames to keep extrapolating the ball's position through a detection gap (e.g. motion blur) before dropping the track")
     parser.add_argument("--match-distance", type=float, default=250.0, help="Max pixel distance a new detection can be from the ball's last known position to be accepted as the same ball")
     parser.add_argument("--no-color-filter", action="store_true", help="Disable the optic yellow-green color check used to prefer the real ball over other round objects")
+    parser.add_argument("--ball-color-min-ratio", type=float, default=0.35, help="Minimum fraction of a candidate box that must be ball-colored to pass the color filter (default 0.35). Lower this if the real ball is being rejected; raise it if other yellow-ish objects (logos, skin, etc.) are being mistaken for the ball")
     parser.add_argument("--device", type=str, default=None, help="Inference device: 'cuda', 'cpu', or omit to auto-detect GPU")
     parser.add_argument("--imgsz", type=int, default=640, help="Inference resolution the model resizes frames to (default 640). Raise to 960-1280 to detect a small/far-away ball better, at the cost of speed")
     parser.add_argument(
@@ -1063,6 +1069,7 @@ def main():
         max_missed_frames=args.max_missed_frames,
         max_match_distance=args.match_distance,
         require_ball_color=not args.no_color_filter,
+        ball_color_min_ratio=args.ball_color_min_ratio,
         device=args.device,
         imgsz=args.imgsz,
         zoom_to_court=args.zoom,
