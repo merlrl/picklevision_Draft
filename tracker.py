@@ -148,7 +148,9 @@ class PickleVisionTracker:
         max_match_distance: float = 250.0,
         ball_color_lower: tuple[int, int, int] = (25, 60, 60),
         ball_color_upper: tuple[int, int, int] = (45, 255, 255),
-        ball_color_min_ratio: float = 0.35,
+        ball_color_min_ratio: float = 0.20,
+        min_aspect_ratio: float = 0.6,
+        min_box_dimension: int = 20,
         require_ball_color: bool = True,
         camera_id: str = "cam0",
         zoom_to_court: bool = False,
@@ -224,6 +226,15 @@ class PickleVisionTracker:
         self.ball_color_upper = np.array(ball_color_upper, dtype=np.uint8)
         self.ball_color_min_ratio = ball_color_min_ratio
         self.require_ball_color = require_ball_color
+
+        # A pickleball's dimples/holes mean even a correct full-ball box is never
+        # near-100% solid ball-color, so color alone can't reliably reject a small
+        # false positive that happens to sit on a solid-colored patch (a shirt
+        # logo, or -- ironically -- a gap between the ball's own holes). Size and
+        # shape are more robust: both observed failure modes (a shirt graphic, a
+        # single hole) produced anomalously small/non-square boxes vs. a real ball.
+        self.min_aspect_ratio = min_aspect_ratio
+        self.min_box_dimension = min_box_dimension
 
     def _get_ball_centroid(self, box):
         x1, y1, x2, y2 = map(float, box)
@@ -321,6 +332,39 @@ class PickleVisionTracker:
         mask = cv2.inRange(hsv, self.ball_color_lower, self.ball_color_upper)
         return float(np.count_nonzero(mask)) / mask.size
 
+    def _is_plausible_ball_shape(self, box):
+        """Reject boxes too small or too non-square to plausibly be a round ball.
+
+        Catches false positives color alone can't: a small logo patch or a single
+        dimple on the ball's own surface can be just as solidly ball-colored as a
+        genuine ball, but tends to be either much smaller than a real detection or
+        an odd (non-square) shape, since a round object's box should be roughly 1:1.
+        """
+        x1, y1, x2, y2 = box
+        w, h = x2 - x1, y2 - y1
+        if min(w, h) < self.min_box_dimension:
+            return False
+        aspect_ratio = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+        return aspect_ratio >= self.min_aspect_ratio
+
+    def _narrow_candidate_pool(self, frame, boxes):
+        """Progressively filter candidates by shape, then color, falling back to a
+        looser stage whenever a stricter one eliminates everything -- so a real
+        ball lacking a strong color match (e.g. mostly in shadow) still gets
+        considered via shape alone, rather than the filter silently doing nothing.
+        """
+        all_indices = np.arange(len(boxes))
+        shape_matches = np.array([i for i in all_indices if self._is_plausible_ball_shape(boxes[i])])
+        pool = shape_matches if len(shape_matches) else all_indices
+
+        if self.require_ball_color:
+            color_ratios = np.array([self._ball_color_ratio(frame, boxes[i]) for i in pool])
+            color_matches = pool[color_ratios >= self.ball_color_min_ratio]
+            if len(color_matches):
+                pool = color_matches
+
+        return pool
+
     def _select_primary_detection(self, frame, boxes, ids, confs):
         """Pick exactly one detection to follow so a stray round object never hijacks the ball ID.
 
@@ -328,8 +372,8 @@ class PickleVisionTracker:
         ByteTrack assigns a new ID after a brief loss (e.g. re-detecting post-blur),
         the closest candidate to the ball's last known position is adopted instead,
         provided it's within `max_match_distance` -- otherwise it's treated as a
-        different object and ignored. Candidates matching the pickleball's optic
-        yellow-green color are preferred over same-class objects of a different color.
+        different object and ignored. Candidates matching the pickleball's shape
+        and optic yellow-green color are preferred over same-class objects that don't.
         """
         if not ids:
             return None
@@ -338,12 +382,7 @@ class PickleVisionTracker:
             idx = ids.index(self.primary_track_id)
             return boxes[idx], ids[idx]
 
-        if self.require_ball_color:
-            color_ratios = np.array([self._ball_color_ratio(frame, b) for b in boxes])
-            color_matches = np.where(color_ratios >= self.ball_color_min_ratio)[0]
-            candidate_pool = color_matches if len(color_matches) else np.arange(len(ids))
-        else:
-            candidate_pool = np.arange(len(ids))
+        candidate_pool = self._narrow_candidate_pool(frame, boxes)
 
         if self.primary_trajectory:
             last_point = np.array(self.primary_trajectory[-1])
@@ -351,15 +390,19 @@ class PickleVisionTracker:
             distances = np.linalg.norm(centroids - last_point, axis=1)
             best_idx = int(candidate_pool[np.argmin(distances[candidate_pool])])
             if distances[best_idx] <= self.max_match_distance:
+                print(f"[Ball Lock] Re-acquired via position match: box={boxes[best_idx]}, distance={distances[best_idx]:.0f}px")
                 return boxes[best_idx], ids[best_idx]
             return None
 
-        # No active lock yet: acquire whichever ball-colored detection the model is most confident about.
+        # No active lock yet: acquire whichever plausible-shaped, ball-colored
+        # detection the model is most confident about.
         if confs is not None and len(confs):
             best_idx = int(candidate_pool[np.argmax(confs[candidate_pool])])
         else:
             best_idx = int(candidate_pool[0])
-        return boxes[best_idx], ids[best_idx]
+        box = boxes[best_idx]
+        print(f"[Ball Lock] Acquired: box={box}, conf={confs[best_idx] if confs is not None and len(confs) else 'n/a'}, color_ratio={self._ball_color_ratio(frame, box):.2f}")
+        return box, ids[best_idx]
 
     def _predict_primary_position(self):
         """Extrapolate the ball's position for a few frames using its last known velocity.
@@ -779,7 +822,9 @@ def parse_args():
     parser.add_argument("--max-missed-frames", type=int, default=15, help="Frames to keep extrapolating the ball's position through a detection gap (e.g. motion blur) before dropping the track")
     parser.add_argument("--match-distance", type=float, default=250.0, help="Max pixel distance a new detection can be from the ball's last known position to be accepted as the same ball")
     parser.add_argument("--no-color-filter", action="store_true", help="Disable the optic yellow-green color check used to prefer the real ball over other round objects")
-    parser.add_argument("--ball-color-min-ratio", type=float, default=0.35, help="Minimum fraction of a candidate box that must be ball-colored to pass the color filter (default 0.35). Lower this if the real ball is being rejected; raise it if other yellow-ish objects (logos, skin, etc.) are being mistaken for the ball")
+    parser.add_argument("--ball-color-min-ratio", type=float, default=0.20, help="Minimum fraction of a candidate box that must be ball-colored to pass the color filter (default 0.20 -- kept fairly loose since the ball's own dimples/holes mean even a correct box is never near-100%% solid color). Lower this if the real ball is being rejected; raise it if other yellow-ish objects (logos, skin, etc.) are being mistaken for the ball")
+    parser.add_argument("--min-box-dimension", type=int, default=20, help="Reject candidate boxes smaller than this (pixels, in the detection frame) as implausibly small to be the actual ball -- catches things like a single dimple/hole on the ball's own surface")
+    parser.add_argument("--min-aspect-ratio", type=float, default=0.6, help="Reject candidate boxes whose width:height ratio isn't roughly square (min(w,h)/max(w,h) below this) -- a round ball's box should be close to 1:1")
     parser.add_argument("--device", type=str, default=None, help="Inference device: 'cuda', 'cpu', or omit to auto-detect GPU")
     parser.add_argument("--imgsz", type=int, default=640, help="Inference resolution the model resizes frames to (default 640). Raise to 960-1280 to detect a small/far-away ball better, at the cost of speed")
     parser.add_argument(
@@ -1070,6 +1115,8 @@ def main():
         max_match_distance=args.match_distance,
         require_ball_color=not args.no_color_filter,
         ball_color_min_ratio=args.ball_color_min_ratio,
+        min_box_dimension=args.min_box_dimension,
+        min_aspect_ratio=args.min_aspect_ratio,
         device=args.device,
         imgsz=args.imgsz,
         zoom_to_court=args.zoom,
