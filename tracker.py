@@ -688,6 +688,7 @@ def parse_args():
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLOv8 model to load")
     parser.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tracking configuration")
     parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold")
+    parser.add_argument("--target-class-id", type=int, default=32, help="Class ID to track (default 32 = COCO 'sports ball', for yolov8n.pt). A custom single-class Roboflow model almost always uses class 0 instead -- pass --target-class-id 0 when using one. Use -1 to track every detected class")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for NMS")
     parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path (boxes/labels/trajectory baked in -- for review, not training)")
     parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training")
@@ -993,6 +994,7 @@ def main():
         imgsz=args.imgsz,
         zoom_to_court=args.zoom,
         zoom_padding=args.zoom_padding,
+        target_class_id=None if args.target_class_id == -1 else args.target_class_id,
     )
     print(f"[Device] Running inference on: {tracker.device}")
 
