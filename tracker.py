@@ -153,16 +153,35 @@ class PickleVisionTracker:
         camera_id: str = "cam0",
         zoom_to_court: bool = False,
         zoom_padding: float = 0.15,
+        use_roboflow: bool = False,
+        roboflow_api_url: str = "http://localhost:9001",
+        roboflow_api_key: str | None = None,
+        roboflow_workspace_name: str | None = None,
+        roboflow_workflow_id: str | None = None,
     ) -> None:
-        if YOLO is None:
-            raise RuntimeError(
-                "Ultralytics is not installed in this environment. "
-                "Install it with: pip install ultralytics"
-            )
-
-        self.model = YOLO(model_name)
-        self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        # Two mutually exclusive detection backends: a local Ultralytics model
+        # (default), or a Roboflow Workflow running on a self-hosted inference
+        # server (for a custom-trained model when weights export isn't available
+        # on the account's plan). Everything downstream of "get boxes+confs for
+        # this frame" -- single-ball lock-on, prediction, color filter, court
+        # mapping, drawing -- is identical either way.
+        self.use_roboflow = use_roboflow
+        if self.use_roboflow:
+            self.model = None
+            self.device = "roboflow-server"
+            self.roboflow_client = InferenceHTTPClient.init(api_url=roboflow_api_url, api_key=roboflow_api_key)
+            self.roboflow_workspace_name = roboflow_workspace_name
+            self.roboflow_workflow_id = roboflow_workflow_id
+            self._roboflow_next_id = 0
+        else:
+            if YOLO is None:
+                raise RuntimeError(
+                    "Ultralytics is not installed in this environment. "
+                    "Install it with: pip install ultralytics"
+                )
+            self.model = YOLO(model_name)
+            self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
 
         self.tracker_config = tracker_config
         self.conf = conf
@@ -484,6 +503,55 @@ class PickleVisionTracker:
             zx1, zy1, zx2, zy2 = self.zoom_roi
             detect_frame = frame[zy1:zy2, zx1:zx2]
 
+        if self.use_roboflow:
+            return self._process_frame_roboflow(detect_frame)
+        return self._process_frame_ultralytics(detect_frame)
+
+    def _process_frame_roboflow(self, detect_frame):
+        """Detect via a Roboflow Workflow on the self-hosted inference server,
+        instead of a local Ultralytics model. The workflow returns fresh
+        per-frame detections with no persistent track ID (unlike ByteTrack), so
+        every detection gets a synthetic ID from a monotonically increasing
+        counter -- never reused across frames, so `_select_primary_detection`'s
+        "same ID still present" fast path can never falsely match an unrelated
+        detection that happens to land at the same list position. Cross-frame
+        continuity instead comes entirely from its position-matching against
+        self.primary_trajectory, same as it would for a lost-then-reacquired
+        ByteTrack ID.
+        """
+        result = self.roboflow_client.run_workflow(
+            workspace_name=self.roboflow_workspace_name,
+            workflow_id=self.roboflow_workflow_id,
+            images={"image": detect_frame},
+        )
+
+        predictions = result[0].get("predictions", {}).get("predictions", []) if result else []
+        if not predictions:
+            return self._handle_missed_detection(detect_frame)
+
+        boxes = []
+        confs = []
+        for pred in predictions:
+            cx, cy, w, h = pred["x"], pred["y"], pred["width"], pred["height"]
+            boxes.append((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2))
+            confs.append(pred.get("confidence", 0.0))
+        boxes = np.array(boxes)
+        confs = np.array(confs)
+
+        ids = list(range(self._roboflow_next_id, self._roboflow_next_id + len(boxes)))
+        self._roboflow_next_id += len(boxes)
+
+        selection = self._select_primary_detection(detect_frame, boxes, ids, confs)
+        if selection is None:
+            return self._handle_missed_detection(detect_frame)
+
+        box, track_id = selection
+        self.primary_track_id = track_id
+        self.missed_frames = 0
+        self._draw_primary_tracking(detect_frame, box, track_id, predicted=False)
+        return detect_frame
+
+    def _process_frame_ultralytics(self, detect_frame):
         results = self.model.track(
             detect_frame,
             persist=True,
@@ -689,6 +757,11 @@ def parse_args():
     parser.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tracking configuration")
     parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold")
     parser.add_argument("--target-class-id", type=int, default=32, help="Class ID to track (default 32 = COCO 'sports ball', for yolov8n.pt). A custom single-class Roboflow model almost always uses class 0 instead -- pass --target-class-id 0 when using one. Use -1 to track every detected class")
+    parser.add_argument("--use-roboflow", action="store_true", help="Detect via a Roboflow Workflow on a self-hosted inference server instead of a local Ultralytics model -- for a custom-trained model when weights export isn't available on the Roboflow plan")
+    parser.add_argument("--roboflow-api-url", type=str, default="http://localhost:9001", help="Self-hosted Roboflow inference server URL")
+    parser.add_argument("--roboflow-api-key", type=str, default="ZceKVfYE1Cvm0jqDdA1F", help="Roboflow API key")
+    parser.add_argument("--roboflow-workspace", type=str, default="franzs-workspace-utuz0", help="Roboflow workspace name")
+    parser.add_argument("--roboflow-workflow-id", type=str, default="pickleball-prototype-vpickleball-prototype-1-yolo11n-t1-logic", help="Roboflow workflow ID")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for NMS")
     parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path (boxes/labels/trajectory baked in -- for review, not training)")
     parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training")
@@ -995,6 +1068,11 @@ def main():
         zoom_to_court=args.zoom,
         zoom_padding=args.zoom_padding,
         target_class_id=None if args.target_class_id == -1 else args.target_class_id,
+        use_roboflow=args.use_roboflow,
+        roboflow_api_url=args.roboflow_api_url,
+        roboflow_api_key=args.roboflow_api_key,
+        roboflow_workspace_name=args.roboflow_workspace,
+        roboflow_workflow_id=args.roboflow_workflow_id,
     )
     print(f"[Device] Running inference on: {tracker.device}")
 
