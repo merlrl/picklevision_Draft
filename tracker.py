@@ -59,15 +59,22 @@ class CourtMapper:
     If a real court is visible, the user can pass four image corners using --court-corners to calibrate it.
     """
 
-    def __init__(self, src_points=None, dst_points=None):
+    def __init__(self, src_points=None, dst_points=None, court_width=20.0, court_length=44.0):
         if src_points is None:
             src_points = np.array([[0, 0], [1920, 0], [1920, 1080], [0, 1080]], dtype=np.float32)
 
         if dst_points is None:
-            dst_points = np.array([[0, 0], [20, 0], [20, 44], [0, 44]], dtype=np.float32)
+            # court_length=44 covers the full court; pass 22 to scope calibration to
+            # just one half (baseline to net) -- useful when only one half is
+            # reliably visible/accurate from a given camera angle.
+            dst_points = np.array(
+                [[0, 0], [court_width, 0], [court_width, court_length], [0, court_length]], dtype=np.float32
+            )
 
         self.src_points = np.array(src_points, dtype=np.float32)
         self.dst_points = np.array(dst_points, dtype=np.float32)
+        self.court_width = court_width
+        self.court_length = court_length
         self.h_matrix = cv2.getPerspectiveTransform(self.src_points, self.dst_points)
 
     @staticmethod
@@ -144,6 +151,8 @@ class PickleVisionTracker:
         ball_color_min_ratio: float = 0.12,
         require_ball_color: bool = True,
         camera_id: str = "cam0",
+        zoom_to_court: bool = False,
+        zoom_padding: float = 0.15,
     ) -> None:
         if YOLO is None:
             raise RuntimeError(
@@ -169,6 +178,16 @@ class PickleVisionTracker:
         self.target_width = target_width
         self.target_height = target_height
         self.camera_id = camera_id
+
+        # "Digital zoom": crop detection/display to the calibrated court region so
+        # the same imgsz budget is spent entirely on the area that matters, instead
+        # of also feeding the model background/ceiling/etc. Only meaningful with a
+        # real calibrated court_mapper (--court-corners), not the default full-frame
+        # fallback. zoom_roi is (x1, y1, x2, y2) in original frame pixels, resolved
+        # lazily against the actual frame/camera size the first time it's needed.
+        self.zoom_to_court = zoom_to_court and court_mapper is not None
+        self.zoom_padding = zoom_padding
+        self.zoom_roi: tuple[int, int, int, int] | None = None
 
         # Single-ball lock-on state (used only when target_class_id is set).
         # Keeps the tracker following one ball instead of every round object YOLO
@@ -231,11 +250,40 @@ class PickleVisionTracker:
         return None
 
     def _classify_in_out(self, court_point):
-        """Use homography-based court mapping to assign a line-call result."""
+        """Use homography-based court mapping to assign a line-call result.
+
+        `court_point` is in whatever frame `process_frame` is currently operating
+        on -- when zoomed, that's the cropped region, so it's offset back to
+        original-frame coordinates first to match the calibrated homography.
+        """
         if court_point is None:
             return "UNKNOWN"
 
+        if self.zoom_roi is not None:
+            offset_x, offset_y, _, _ = self.zoom_roi
+            court_point = (court_point[0] + offset_x, court_point[1] + offset_y)
+
         return self.court_mapper.classify(court_point)
+
+    def _compute_zoom_roi(self, frame_width, frame_height):
+        """Bounding box (with padding) around the calibrated court corners, in
+        original frame pixels -- the region `process_frame` crops to when
+        `zoom_to_court` is enabled.
+        """
+        xs = self.court_mapper.src_points[:, 0]
+        ys = self.court_mapper.src_points[:, 1]
+        x_min, x_max = float(np.min(xs)), float(np.max(xs))
+        y_min, y_max = float(np.min(ys)), float(np.max(ys))
+        pad_x = (x_max - x_min) * self.zoom_padding
+        pad_y = (y_max - y_min) * self.zoom_padding
+
+        x1 = max(0, int(x_min - pad_x))
+        y1 = max(0, int(y_min - pad_y))
+        x2 = min(frame_width, int(x_max + pad_x))
+        y2 = min(frame_height, int(y_max + pad_y))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
 
     def _ball_color_ratio(self, frame, box):
         """Fraction of pixels inside `box` matching the pickleball's optic yellow-green.
@@ -428,8 +476,16 @@ class PickleVisionTracker:
     def process_frame(self, frame):
         self.frame_index += 1
 
+        if self.zoom_to_court and self.zoom_roi is None:
+            self.zoom_roi = self._compute_zoom_roi(frame.shape[1], frame.shape[0])
+
+        detect_frame = frame
+        if self.zoom_roi is not None:
+            zx1, zy1, zx2, zy2 = self.zoom_roi
+            detect_frame = frame[zy1:zy2, zx1:zx2]
+
         results = self.model.track(
-            frame,
+            detect_frame,
             persist=True,
             tracker=self.tracker_config,
             conf=self.conf,
@@ -439,38 +495,38 @@ class PickleVisionTracker:
         )
 
         if not results or len(results) == 0:
-            return self._handle_missed_detection(frame) if self.target_class_id is not None else frame
+            return self._handle_missed_detection(detect_frame) if self.target_class_id is not None else detect_frame
 
         result = results[0]
         if result.boxes is None or result.boxes.id is None:
-            return self._handle_missed_detection(frame) if self.target_class_id is not None else frame
+            return self._handle_missed_detection(detect_frame) if self.target_class_id is not None else detect_frame
 
         if self.target_class_id is not None:
             cls_ids = result.boxes.cls.int().cpu().tolist()
             valid_indices = [i for i, cls_id in enumerate(cls_ids) if cls_id == self.target_class_id]
             if not valid_indices:
-                return self._handle_missed_detection(frame)
+                return self._handle_missed_detection(detect_frame)
 
             filtered_boxes = result.boxes.xyxy.cpu().numpy()[valid_indices]
             filtered_ids = result.boxes.id.int().cpu().numpy()[valid_indices].tolist()
             filtered_confs = result.boxes.conf.cpu().numpy()[valid_indices]
 
-            selection = self._select_primary_detection(frame, filtered_boxes, filtered_ids, filtered_confs)
+            selection = self._select_primary_detection(detect_frame, filtered_boxes, filtered_ids, filtered_confs)
             if selection is None:
-                return self._handle_missed_detection(frame)
+                return self._handle_missed_detection(detect_frame)
 
             box, track_id = selection
             self.primary_track_id = track_id
             self.missed_frames = 0
-            self._draw_primary_tracking(frame, box, track_id, predicted=False)
-            return frame
+            self._draw_primary_tracking(detect_frame, box, track_id, predicted=False)
+            return detect_frame
 
         filtered_boxes = result.boxes.xyxy.cpu().numpy()
         filtered_ids = result.boxes.id.int().cpu().tolist()
-        self._draw_tracking(frame, filtered_boxes, filtered_ids)
-        return frame
+        self._draw_tracking(detect_frame, filtered_boxes, filtered_ids)
+        return detect_frame
 
-    def run_video(self, source, output_path=None, show_window=True):
+    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None):
         if isinstance(source, Path):
             video_source = str(source)
         elif isinstance(source, int):
@@ -519,6 +575,15 @@ class PickleVisionTracker:
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         print(f"[Camera Actual] {width}x{height} @ {fps}fps")
 
+        if self.zoom_to_court and self.zoom_roi is None:
+            self.zoom_roi = self._compute_zoom_roi(width, height)
+
+        output_width, output_height = width, height
+        if self.zoom_roi is not None:
+            zx1, zy1, zx2, zy2 = self.zoom_roi
+            output_width, output_height = zx2 - zx1, zy2 - zy1
+            print(f"[Zoom] Cropping to calibrated court region: {output_width}x{output_height} (from ({zx1},{zy1}) to ({zx2},{zy2}))")
+
         writer = None
         if output_path:
             output_path = Path(output_path)
@@ -527,18 +592,43 @@ class PickleVisionTracker:
                 str(output_path),
                 cv2.VideoWriter_fourcc(*"mp4v"),
                 fps,
+                (output_width, output_height),
+            )
+
+        # Separate from `writer`: saves the frame BEFORE any boxes/labels/trajectory
+        # lines are drawn on it, so this file is safe to upload to Roboflow for
+        # annotation/training. `writer` above bakes the overlay in permanently and
+        # is only meant for reviewing/demoing tracking results, not as training data.
+        raw_writer = None
+        if raw_output_path:
+            raw_output_path = Path(raw_output_path)
+            raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_writer = cv2.VideoWriter(
+                str(raw_output_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
                 (width, height),
             )
+            print(f"[Raw Recording] Saving unannotated footage to {raw_output_path} (Roboflow-ready)")
 
         window_name = "Project PickleVision - Single Camera Draft"
         if show_window:
             # WINDOW_NORMAL makes it resizable/draggable; the initial size is just a
             # display cap so a 1920x1080 capture doesn't overflow a laptop screen --
-            # recording and detection still use the full captured resolution.
+            # recording and detection still use the full captured (or zoomed) resolution.
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            display_width = min(width, 1280)
-            display_height = int(display_width * height / width) if width else height
+            display_width = min(output_width, 1280)
+            display_height = int(display_width * output_height / output_width) if output_width else output_height
             cv2.resizeWindow(window_name, display_width, display_height)
+
+        # Frame-pace the recording to wall-clock time instead of writing one frame
+        # per loop iteration. Per-frame processing (detection/tracking/drawing) is
+        # usually slower than the camera's nominal fps, so a naive 1-write-per-loop
+        # would compress a longer real session into fewer frames than `fps` implies,
+        # playing back sped-up/timelapsed. Duplicating the latest frame to catch up
+        # to elapsed real time keeps recorded duration matching real duration.
+        record_start = time.time()
+        frames_written = 0
 
         try:
             while cap.isOpened():
@@ -546,10 +636,21 @@ class PickleVisionTracker:
                 if not success:
                     break
 
+                # Must copy before process_frame() -- it draws directly onto the
+                # array it's given (or, with zoom, onto a view sharing memory with
+                # this same frame), so anything not copied first ends up annotated too.
+                raw_frame = frame.copy() if raw_writer is not None else None
+
                 annotated = self.process_frame(frame)
 
-                if writer is not None:
-                    writer.write(annotated)
+                if writer is not None or raw_writer is not None:
+                    expected_frames = int((time.time() - record_start) * fps)
+                    while frames_written <= expected_frames:
+                        if writer is not None:
+                            writer.write(annotated)
+                        if raw_writer is not None:
+                            raw_writer.write(raw_frame)
+                        frames_written += 1
 
                 if show_window:
                     cv2.imshow(window_name, annotated)
@@ -559,6 +660,8 @@ class PickleVisionTracker:
             cap.release()
             if writer is not None:
                 writer.release()
+            if raw_writer is not None:
+                raw_writer.release()
             if show_window:
                 cv2.destroyAllWindows()
 
@@ -572,7 +675,8 @@ def parse_args():
     parser.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tracking configuration")
     parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for NMS")
-    parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path")
+    parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path (boxes/labels/trajectory baked in -- for review, not training)")
+    parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training")
     parser.add_argument("--show", action="store_true", default=True, help="Display annotated frames in real-time")
     parser.add_argument("--fps", type=int, default=30, help="Target camera FPS (default: 30; use 120 for ELP camera)")
     parser.add_argument("--width", type=int, default=640, help="Target camera width in pixels (default: 640; use 1920 for ELP camera)")
@@ -589,6 +693,10 @@ def parse_args():
         help="Interactively click the court's 4 corners on the live feed to generate a --court-corners string, then exit without tracking",
     )
     parser.add_argument("--calibration-output", type=str, default=None, help="Optional file path to save the calibrated --court-corners string to")
+    parser.add_argument("--court-length", type=float, default=44.0, help="Real-world length (ft) of the calibrated region: 44 for a full court, 22 to scope to just one half (baseline to net)")
+    parser.add_argument("--court-width", type=float, default=20.0, help="Real-world width (ft) of the calibrated region (default 20, standard doubles court width)")
+    parser.add_argument("--zoom", action="store_true", help="Digitally zoom: crop detection/display/recording to the calibrated court region (requires --court-corners)")
+    parser.add_argument("--zoom-padding", type=float, default=0.15, help="Padding around the calibrated court corners when zoomed, as a fraction of the court's width/height (default 0.15)")
     return parser.parse_args()
 
 
@@ -682,24 +790,37 @@ def _court_reference_lines(mapper: CourtMapper):
     x_max = float(np.max(mapper.dst_points[:, 0]))
     y_min = float(np.min(mapper.dst_points[:, 1]))
     y_max = float(np.max(mapper.dst_points[:, 1]))
-    length = y_max - y_min
     width = x_max - x_min
-    net_y = y_min + length / 2.0
-    kitchen_near_y = net_y - 7.0
-    kitchen_far_y = net_y + 7.0
     center_x = x_min + width / 2.0
 
     segments = [
-        ((x_min, y_min), (x_max, y_min)),  # baseline
-        ((x_min, y_max), (x_max, y_max)),  # baseline
+        ((x_min, y_min), (x_max, y_min)),  # near edge
+        ((x_min, y_max), (x_max, y_max)),  # far edge
         ((x_min, y_min), (x_min, y_max)),  # sideline
         ((x_max, y_min), (x_max, y_max)),  # sideline
-        ((x_min, net_y), (x_max, net_y)),  # net
-        ((x_min, kitchen_near_y), (x_max, kitchen_near_y)),  # kitchen line
-        ((x_min, kitchen_far_y), (x_max, kitchen_far_y)),  # kitchen line
-        ((center_x, y_min), (center_x, kitchen_near_y)),  # centerline (near half)
-        ((center_x, kitchen_far_y), (center_x, y_max)),  # centerline (far half)
     ]
+
+    if abs(mapper.court_length - 44.0) < 1.0:
+        # Full-court calibration: net sits at the midpoint, kitchen 7ft each side.
+        net_y = y_min + mapper.court_length / 2.0
+        kitchen_near_y = net_y - 7.0
+        kitchen_far_y = net_y + 7.0
+        segments += [
+            ((x_min, net_y), (x_max, net_y)),
+            ((x_min, kitchen_near_y), (x_max, kitchen_near_y)),
+            ((x_min, kitchen_far_y), (x_max, kitchen_far_y)),
+            ((center_x, y_min), (center_x, kitchen_near_y)),
+            ((center_x, kitchen_far_y), (center_x, y_max)),
+        ]
+    else:
+        # Half-court calibration (baseline -> net): the far edge IS the net.
+        net_y = y_max
+        kitchen_y = net_y - 7.0
+        segments += [
+            ((x_min, net_y), (x_max, net_y)),
+            ((x_min, kitchen_y), (x_max, kitchen_y)),
+            ((center_x, y_min), (center_x, kitchen_y)),
+        ]
 
     endpoints = np.array(segments, dtype=np.float32).reshape(-1, 1, 2)
     inv_h = np.linalg.inv(mapper.h_matrix)
@@ -707,14 +828,20 @@ def _court_reference_lines(mapper: CourtMapper):
     return [(tuple(pair[0]), tuple(pair[1])) for pair in mapped]
 
 
-def calibrate_court_corners(source, save_path: str | None = None):
+def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0):
     """Interactively click the court's 4 real-world corners on a live camera feed.
 
     Click order matters -- it must match CourtMapper's default destination
     rectangle (TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT, i.e. clockwise
-    starting from whichever corner you treat as the origin). On a real court,
-    click the 4 baseline/sideline intersections in that order. Press 's' to
-    save once 4 points are placed, 'r' to reset, 'q' to cancel.
+    starting from whichever corner you treat as the origin).
+
+    For a full court (court_length=44), TOP = far baseline, BOTTOM = near
+    baseline (the one closest to the camera). For a half-court calibration
+    (court_length=22, baseline-to-net only -- useful when the far half of the
+    court isn't reliably visible from this camera angle), TOP = the net line,
+    BOTTOM = the near baseline.
+
+    Press 's' to save once 4 points are placed, 'r' to reset, 'q' to cancel.
 
     Returns the "x1 y1 x2 y2 x3 y3 x4 y4" string ready for --court-corners, or
     None if cancelled.
@@ -734,7 +861,9 @@ def calibrate_court_corners(source, save_path: str | None = None):
     cv2.namedWindow(window_name)
     cv2.setMouseCallback(window_name, on_click)
 
-    print("Click the 4 court corners in order: TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT.")
+    far_edge_label = "the NET line" if abs(court_length - 44.0) >= 1.0 else "the FAR baseline"
+    print(f"Calibrating a {court_width:.0f}x{court_length:.0f} ft region.")
+    print(f"Click in order: TOP-LEFT, TOP-RIGHT ({far_edge_label}), then BOTTOM-RIGHT, BOTTOM-LEFT (the NEAR baseline).")
     print("Keys: 'r' reset points | 's' save (once 4 are placed) | 'q' cancel")
 
     corner_str = None
@@ -756,7 +885,11 @@ def calibrate_court_corners(source, save_path: str | None = None):
                 cv2.putText(display, "Press 's' to save, 'r' to reset", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 try:
-                    preview_mapper = CourtMapper(src_points=np.array(clicked, dtype=np.float32))
+                    preview_mapper = CourtMapper(
+                        src_points=np.array(clicked, dtype=np.float32),
+                        court_width=court_width,
+                        court_length=court_length,
+                    )
                     for (lx1, ly1), (lx2, ly2) in _court_reference_lines(preview_mapper):
                         cv2.line(display, (int(lx1), int(ly1)), (int(lx2), int(ly2)), (255, 255, 0), 1)
                     cv2.putText(
@@ -814,11 +947,20 @@ def main():
         source = int(source)
 
     if args.calibrate:
-        calibrate_court_corners(source, save_path=args.calibration_output)
+        calibrate_court_corners(
+            source,
+            save_path=args.calibration_output,
+            court_width=args.court_width,
+            court_length=args.court_length,
+        )
         return
 
     court_points = CourtMapper.parse_corners(args.court_corners) if args.court_corners else None
-    court_mapper = CourtMapper(src_points=court_points) if court_points is not None else None
+    court_mapper = (
+        CourtMapper(src_points=court_points, court_width=args.court_width, court_length=args.court_length)
+        if court_points is not None
+        else None
+    )
 
     tracker = PickleVisionTracker(
         model_name=args.model,
@@ -834,10 +976,12 @@ def main():
         require_ball_color=not args.no_color_filter,
         device=args.device,
         imgsz=args.imgsz,
+        zoom_to_court=args.zoom,
+        zoom_padding=args.zoom_padding,
     )
     print(f"[Device] Running inference on: {tracker.device}")
 
-    events = tracker.run_video(source=source, output_path=args.output, show_window=args.show)
+    events = tracker.run_video(source=source, output_path=args.output, show_window=args.show, raw_output_path=args.raw_output)
     print(f"\n[Summary] Tracked {len(events)} candidate ball events.")
 
 

@@ -4,3 +4,5 @@ __pycache__/
 *.pt
 *.onnx
 *.engine
+recordings/
+corners.txt
