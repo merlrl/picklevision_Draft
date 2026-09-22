@@ -798,6 +798,11 @@ class PickleVisionTracker:
         max_catchup_frames_per_iteration = max(1, int(effective_record_fps))
 
         current_exposure = exposure
+        # CAP_PROP_AUTO_EXPOSURE is only set once (already done above at startup
+        # if --exposure was passed) rather than on every keypress -- repeatedly
+        # toggling it live was destabilizing the driver, causing the reported
+        # flicker between a brief auto-corrected bright frame and the forced dark one.
+        auto_exposure_disabled = exposure is not None
         if isinstance(video_source, int):
             print("[Controls] ']' = brighten (raise exposure) | '[' = darken (lower exposure) | 'q' = quit")
 
@@ -838,10 +843,18 @@ class PickleVisionTracker:
                         # stopping/editing --exposure/rerunning for every attempt.
                         # cap.get() is unreliable on this camera (see --exposure
                         # help), so real captured brightness is printed instead as
-                        # the trustworthy signal to judge by.
+                        # the trustworthy signal to judge by. Clamped to this
+                        # camera's actual valid range (verified via testing) --
+                        # holding the key down auto-repeats fast enough to run
+                        # away to a nonsensical value (e.g. 160) otherwise, which
+                        # the driver can't interpret and falls back to erratic
+                        # auto-exposure-like flicker instead of a clean manual value.
                         base = current_exposure if current_exposure is not None else -6.0
-                        current_exposure = base + (1.0 if key == ord("]") else -1.0)
-                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                        step = 1.0 if key == ord("]") else -1.0
+                        current_exposure = max(-13.0, min(-1.0, base + step))
+                        if not auto_exposure_disabled:
+                            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                            auto_exposure_disabled = True
                         cap.set(cv2.CAP_PROP_EXPOSURE, current_exposure)
                         print(f"[Exposure] -> {current_exposure} (brightness={frame.mean():.1f})")
         finally:
