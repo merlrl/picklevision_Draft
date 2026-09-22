@@ -740,12 +740,20 @@ class PickleVisionTracker:
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         print(f"[Camera Actual] {width}x{height} @ {fps}fps")
 
-        # Recording writes video-encode (CPU) work on top of detection (GPU) work --
-        # a high capture fps (120) is valuable for detection/motion-blur, but encoding
-        # two full-resolution streams at that same rate is real, sustained CPU cost
-        # that can starve the detection loop. Default the SAVED file to a lower fps
-        # than capture; every frame is still detected on, just not every one written.
-        effective_record_fps = record_fps if record_fps else min(fps, 30)
+        # Recording writes video-encode (CPU) work on top of detection work -- a
+        # high capture fps (120) is valuable for detection/motion-blur, but
+        # encoding streams at a target far above what's actually achievable is
+        # actively counterproductive: the frame-pacing catch-up logic below has
+        # to write several duplicate frames per cycle to keep up, and each of
+        # those writes costs real encoding time, slowing the next cycle and
+        # needing even more catch-up -- a real feedback loop, benchmarked to
+        # crash real throughput from ~10fps to ~2fps when the gap is large
+        # (record_fps=30 target against a Roboflow HTTP round-trip's ~8-13fps
+        # ceiling). The Roboflow backend defaults much lower than the local
+        # Ultralytics one for exactly this reason -- every frame is still
+        # detected on either way, just not every one written to the file.
+        default_record_fps = 10 if self.use_roboflow else 30
+        effective_record_fps = record_fps if record_fps else min(fps, default_record_fps)
         if (output_path or raw_output_path) and effective_record_fps < fps:
             print(f"[Recording] Capturing/detecting at {fps}fps, writing video at {effective_record_fps}fps")
 
