@@ -797,6 +797,10 @@ class PickleVisionTracker:
         frames_written = 0
         max_catchup_frames_per_iteration = max(1, int(effective_record_fps))
 
+        current_exposure = exposure
+        if isinstance(video_source, int):
+            print("[Controls] ']' = brighten (raise exposure) | '[' = darken (lower exposure) | 'q' = quit")
+
         try:
             while cap.isOpened():
                 success, frame = cap.read()
@@ -826,8 +830,20 @@ class PickleVisionTracker:
 
                 if show_window:
                     cv2.imshow(window_name, annotated)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
                         break
+                    if key in (ord("]"), ord("[")) and isinstance(video_source, int):
+                        # Live-tune exposure while watching the feed, instead of
+                        # stopping/editing --exposure/rerunning for every attempt.
+                        # cap.get() is unreliable on this camera (see --exposure
+                        # help), so real captured brightness is printed instead as
+                        # the trustworthy signal to judge by.
+                        base = current_exposure if current_exposure is not None else -6.0
+                        current_exposure = base + (1.0 if key == ord("]") else -1.0)
+                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                        cap.set(cv2.CAP_PROP_EXPOSURE, current_exposure)
+                        print(f"[Exposure] -> {current_exposure} (brightness={frame.mean():.1f})")
         finally:
             cap.release()
             if writer is not None:
