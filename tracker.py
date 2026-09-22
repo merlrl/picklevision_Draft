@@ -667,7 +667,7 @@ class PickleVisionTracker:
         self._draw_tracking(detect_frame, filtered_boxes, filtered_ids)
         return detect_frame
 
-    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None, record_fps=None, flip_horizontal=False, flip_vertical=False):
+    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None, record_fps=None, flip_horizontal=False, flip_vertical=False, exposure=None):
         if isinstance(source, Path):
             video_source = str(source)
         elif isinstance(source, int):
@@ -710,6 +710,19 @@ class PickleVisionTracker:
             cap.set(cv2.CAP_PROP_FPS, self.target_fps)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
             print(f"[Camera Config] Requesting {self.target_width}x{self.target_height} @ {self.target_fps}fps (MJPEG)")
+
+            if exposure is not None:
+                # EXPERIMENTAL: manual exposure to shorten shutter time and reduce
+                # motion blur, at the cost of a darker image needing more light.
+                # Verified on the ELP camera this project targets: cap.get() always
+                # reads back a fixed value regardless of what was actually set (a
+                # driver quirk, not a bug here) -- but the real captured brightness
+                # DOES change measurably and monotonically with the requested value,
+                # confirmed by direct brightness sampling. Don't trust the printed
+                # "reports" values as ground truth; judge by the actual image instead.
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+                print(f"[Camera Config] Requested manual exposure={exposure} (this camera's .get() readback is unreliable -- judge by the actual image brightness/blur, not the reported value)")
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -865,6 +878,7 @@ def parse_args():
     parser.add_argument("--calibration-output", type=str, default=None, help="Optional file path to save the calibrated --court-corners string to")
     parser.add_argument("--flip-horizontal", action="store_true", help="Flip the camera feed horizontally (fixes a mirrored image, e.g. left/right reversed) before detection, display, and recording")
     parser.add_argument("--flip-vertical", action="store_true", help="Flip the camera feed vertically (e.g. if the camera is mounted upside down) before detection, display, and recording")
+    parser.add_argument("--exposure", type=float, default=None, help="EXPERIMENTAL: force manual camera exposure to reduce motion blur (lower = shorter shutter = less blur, but needs more light). Effect is highly camera/driver-dependent -- try values like -6, -8, -10")
     parser.add_argument("--court-length", type=float, default=44.0, help="Real-world length (ft) of the calibrated region: 44 for a full court, 22 to scope to just one half (baseline to net)")
     parser.add_argument("--court-width", type=float, default=20.0, help="Real-world width (ft) of the calibrated region (default 20, standard doubles court width)")
     parser.add_argument("--zoom", action="store_true", help="Digitally zoom: crop detection/display/recording to the calibrated court region (requires --court-corners)")
@@ -1177,6 +1191,7 @@ def main():
         record_fps=args.record_fps,
         flip_horizontal=args.flip_horizontal,
         flip_vertical=args.flip_vertical,
+        exposure=args.exposure,
     )
     print(f"\n[Summary] Tracked {len(events)} candidate ball events.")
 
