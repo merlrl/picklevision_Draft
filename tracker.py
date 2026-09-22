@@ -843,20 +843,23 @@ class PickleVisionTracker:
                         # stopping/editing --exposure/rerunning for every attempt.
                         # cap.get() is unreliable on this camera (see --exposure
                         # help), so real captured brightness is printed instead as
-                        # the trustworthy signal to judge by. Clamped to this
-                        # camera's actual valid range (verified via testing) --
-                        # holding the key down auto-repeats fast enough to run
-                        # away to a nonsensical value (e.g. 160) otherwise, which
-                        # the driver can't interpret and falls back to erratic
-                        # auto-exposure-like flicker instead of a clean manual value.
-                        base = current_exposure if current_exposure is not None else -6.0
-                        step = 1.0 if key == ord("]") else -1.0
-                        current_exposure = max(-13.0, min(-1.0, base + step))
+                        # the trustworthy signal to judge by.
+                        #
+                        # This camera takes positive values (measured: 160 gave
+                        # brightness nearly identical to the auto-exposure default),
+                        # likely exposure time in 100-microsecond units, not the
+                        # small-negative-number convention some other cameras use.
+                        # A multiplicative step keeps adjustment speed reasonable
+                        # across a wide range, clamped so a held-down key can't run
+                        # away to an extreme the driver can't interpret sanely.
+                        base = current_exposure if current_exposure is not None else 160.0
+                        factor = 1.25 if key == ord("]") else 0.8
+                        current_exposure = max(1.0, min(5000.0, base * factor))
                         if not auto_exposure_disabled:
                             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
                             auto_exposure_disabled = True
                         cap.set(cv2.CAP_PROP_EXPOSURE, current_exposure)
-                        print(f"[Exposure] -> {current_exposure} (brightness={frame.mean():.1f})")
+                        print(f"[Exposure] -> {current_exposure:.1f} (brightness={frame.mean():.1f})")
         finally:
             cap.release()
             if writer is not None:
@@ -907,7 +910,7 @@ def parse_args():
     parser.add_argument("--calibration-output", type=str, default=None, help="Optional file path to save the calibrated --court-corners string to")
     parser.add_argument("--flip-horizontal", action="store_true", help="Flip the camera feed horizontally (fixes a mirrored image, e.g. left/right reversed) before detection, display, and recording")
     parser.add_argument("--flip-vertical", action="store_true", help="Flip the camera feed vertically (e.g. if the camera is mounted upside down) before detection, display, and recording")
-    parser.add_argument("--exposure", type=float, default=None, help="EXPERIMENTAL: force manual camera exposure to reduce motion blur (lower = shorter shutter = less blur, but needs more light). Effect is highly camera/driver-dependent -- try values like -6, -8, -10")
+    parser.add_argument("--exposure", type=float, default=None, help="EXPERIMENTAL: force manual camera exposure to reduce motion blur (lower = shorter shutter = less blur, but needs more light). On the ELP camera this project targets, values are positive (likely 100-microsecond units) -- 160 measured close to the auto-exposure default; try values roughly 20-300. Effect is highly camera/driver-dependent")
     parser.add_argument("--court-length", type=float, default=44.0, help="Real-world length (ft) of the calibrated region: 44 for a full court, 22 to scope to just one half (baseline to net)")
     parser.add_argument("--court-width", type=float, default=20.0, help="Real-world width (ft) of the calibrated region (default 20, standard doubles court width)")
     parser.add_argument("--zoom", action="store_true", help="Digitally zoom: crop detection/display/recording to the calibrated court region (requires --court-corners)")
