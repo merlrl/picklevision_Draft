@@ -667,7 +667,7 @@ class PickleVisionTracker:
         self._draw_tracking(detect_frame, filtered_boxes, filtered_ids)
         return detect_frame
 
-    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None, record_fps=None):
+    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None, record_fps=None, flip_horizontal=False, flip_vertical=False):
         if isinstance(source, Path):
             video_source = str(source)
         elif isinstance(source, int):
@@ -790,6 +790,10 @@ class PickleVisionTracker:
                 if not success:
                     break
 
+                if flip_horizontal or flip_vertical:
+                    flip_code = -1 if (flip_horizontal and flip_vertical) else (1 if flip_horizontal else 0)
+                    frame = cv2.flip(frame, flip_code)
+
                 # Must copy before process_frame() -- it draws directly onto the
                 # array it's given (or, with zoom, onto a view sharing memory with
                 # this same frame), so anything not copied first ends up annotated too.
@@ -859,6 +863,8 @@ def parse_args():
         help="Interactively click the court's 4 corners on the live feed to generate a --court-corners string, then exit without tracking",
     )
     parser.add_argument("--calibration-output", type=str, default=None, help="Optional file path to save the calibrated --court-corners string to")
+    parser.add_argument("--flip-horizontal", action="store_true", help="Flip the camera feed horizontally (fixes a mirrored image, e.g. left/right reversed) before detection, display, and recording")
+    parser.add_argument("--flip-vertical", action="store_true", help="Flip the camera feed vertically (e.g. if the camera is mounted upside down) before detection, display, and recording")
     parser.add_argument("--court-length", type=float, default=44.0, help="Real-world length (ft) of the calibrated region: 44 for a full court, 22 to scope to just one half (baseline to net)")
     parser.add_argument("--court-width", type=float, default=20.0, help="Real-world width (ft) of the calibrated region (default 20, standard doubles court width)")
     parser.add_argument("--zoom", action="store_true", help="Digitally zoom: crop detection/display/recording to the calibrated court region (requires --court-corners)")
@@ -994,7 +1000,7 @@ def _court_reference_lines(mapper: CourtMapper):
     return [(tuple(pair[0]), tuple(pair[1])) for pair in mapped]
 
 
-def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0):
+def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0, flip_horizontal=False, flip_vertical=False):
     """Interactively click the court's 4 real-world corners on a live camera feed.
 
     Click order matters -- it must match CourtMapper's default destination
@@ -1039,6 +1045,10 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
             if not success:
                 print("Failed to read frame from camera.")
                 break
+
+            if flip_horizontal or flip_vertical:
+                flip_code = -1 if (flip_horizontal and flip_vertical) else (1 if flip_horizontal else 0)
+                frame = cv2.flip(frame, flip_code)
 
             display = frame.copy()
             for i, pt in enumerate(clicked):
@@ -1118,6 +1128,8 @@ def main():
             save_path=args.calibration_output,
             court_width=args.court_width,
             court_length=args.court_length,
+            flip_horizontal=args.flip_horizontal,
+            flip_vertical=args.flip_vertical,
         )
         return
 
@@ -1163,6 +1175,8 @@ def main():
         show_window=args.show,
         raw_output_path=args.raw_output,
         record_fps=args.record_fps,
+        flip_horizontal=args.flip_horizontal,
+        flip_vertical=args.flip_vertical,
     )
     print(f"\n[Summary] Tracked {len(events)} candidate ball events.")
 
