@@ -159,20 +159,30 @@ class PickleVisionTracker:
         roboflow_api_url: str = "http://localhost:9001",
         roboflow_api_key: str | None = None,
         roboflow_workspace_name: str | None = None,
+        roboflow_model_id: str | None = None,
         roboflow_workflow_id: str | None = None,
     ) -> None:
         # Two mutually exclusive detection backends: a local Ultralytics model
-        # (default), or a Roboflow Workflow running on a self-hosted inference
-        # server (for a custom-trained model when weights export isn't available
-        # on the account's plan). Everything downstream of "get boxes+confs for
-        # this frame" -- single-ball lock-on, prediction, color filter, court
-        # mapping, drawing -- is identical either way.
+        # (default), or a Roboflow model/Workflow running on a self-hosted
+        # inference server (for a custom-trained model when weights export isn't
+        # available on the account's plan). Everything downstream of "get
+        # boxes+confs for this frame" -- single-ball lock-on, prediction, color
+        # filter, court mapping, drawing -- is identical either way.
+        #
+        # roboflow_model_id (e.g. "project-slug/3") calls the model directly and
+        # is preferred: it's a plain, well-documented response schema, and it
+        # references an exact version. roboflow_workflow_id is a fallback for
+        # when a Workflow's own custom logic is actually needed -- note a
+        # Workflow's "Project" block pins its own model version independently of
+        # whatever is set as "Current Model" on the project's Deployments page,
+        # so it can silently keep serving an old version after retraining.
         self.use_roboflow = use_roboflow
         if self.use_roboflow:
             self.model = None
             self.device = "roboflow-server"
             self.roboflow_client = InferenceHTTPClient.init(api_url=roboflow_api_url, api_key=roboflow_api_key)
             self.roboflow_workspace_name = roboflow_workspace_name
+            self.roboflow_model_id = roboflow_model_id
             self.roboflow_workflow_id = roboflow_workflow_id
             self._roboflow_next_id = 0
         else:
@@ -550,29 +560,44 @@ class PickleVisionTracker:
             return self._process_frame_roboflow(detect_frame)
         return self._process_frame_ultralytics(detect_frame)
 
-    def _process_frame_roboflow(self, detect_frame):
-        """Detect via a Roboflow Workflow on the self-hosted inference server,
-        instead of a local Ultralytics model. The workflow returns fresh
-        per-frame detections with no persistent track ID (unlike ByteTrack), so
-        every detection gets a synthetic ID from a monotonically increasing
-        counter -- never reused across frames, so `_select_primary_detection`'s
-        "same ID still present" fast path can never falsely match an unrelated
-        detection that happens to land at the same list position. Cross-frame
-        continuity instead comes entirely from its position-matching against
-        self.primary_trajectory, same as it would for a lost-then-reacquired
-        ByteTrack ID.
+    def _fetch_roboflow_predictions(self, detect_frame):
+        """Get the raw predictions list, preferring a direct model_id call.
+
+        Direct model inference (self.roboflow_model_id, e.g. "project-slug/3")
+        references an exact trained version and returns a plain, flat schema.
+        The Workflow path (self.roboflow_workflow_id) is a fallback for when a
+        Workflow's own custom logic is genuinely needed -- but a Workflow's
+        "Project" block pins its own model version independently of whatever is
+        set as "Current Model" on the Deployments page, so after retraining it
+        can silently keep serving a stale version even though the UI looks updated.
         """
+        if self.roboflow_model_id:
+            result = self.roboflow_client.infer(detect_frame, model_id=self.roboflow_model_id)
+            return result.get("predictions", [])
+
         result = self.roboflow_client.run_workflow(
             workspace_name=self.roboflow_workspace_name,
             workflow_id=self.roboflow_workflow_id,
             images={"image": detect_frame},
         )
+        return result[0].get("predictions", {}).get("predictions", []) if result else []
 
-        predictions = result[0].get("predictions", {}).get("predictions", []) if result else []
-        # self.conf is applied here explicitly -- the workflow has its own
-        # internal threshold, but it's a separate setting configured in the
-        # Roboflow UI, not something this call controls, so low-confidence
-        # noise isn't otherwise guaranteed to be filtered out.
+    def _process_frame_roboflow(self, detect_frame):
+        """Detect via Roboflow on the self-hosted inference server, instead of a
+        local Ultralytics model. Roboflow returns fresh per-frame detections
+        with no persistent track ID (unlike ByteTrack), so every detection gets
+        a synthetic ID from a monotonically increasing counter -- never reused
+        across frames, so `_select_primary_detection`'s "same ID still present"
+        fast path can never falsely match an unrelated detection that happens to
+        land at the same list position. Cross-frame continuity instead comes
+        entirely from its position-matching against self.primary_trajectory,
+        same as it would for a lost-then-reacquired ByteTrack ID.
+        """
+        predictions = self._fetch_roboflow_predictions(detect_frame)
+        # self.conf is applied here explicitly -- Roboflow's own internal
+        # threshold is a separate setting configured in its UI, not something
+        # this call controls, so low-confidence noise isn't otherwise
+        # guaranteed to be filtered out.
         predictions = [p for p in predictions if p.get("confidence", 0.0) >= self.conf]
         if not predictions:
             return self._handle_missed_detection(detect_frame)
@@ -809,7 +834,8 @@ def parse_args():
     parser.add_argument("--roboflow-api-url", type=str, default="http://localhost:9001", help="Self-hosted Roboflow inference server URL")
     parser.add_argument("--roboflow-api-key", type=str, default="ZceKVfYE1Cvm0jqDdA1F", help="Roboflow API key")
     parser.add_argument("--roboflow-workspace", type=str, default="franzs-workspace-utuz0", help="Roboflow workspace name")
-    parser.add_argument("--roboflow-workflow-id", type=str, default="pickleball-prototype-vpickleball-prototype-1-yolo11n-t1-logic", help="Roboflow workflow ID")
+    parser.add_argument("--roboflow-model-id", type=str, default="pickleball-prototype/3", help="Roboflow model ID as 'project-slug/version' -- calls the model directly (preferred: exact version, simple response). Pass an empty string to use --roboflow-workflow-id instead")
+    parser.add_argument("--roboflow-workflow-id", type=str, default=None, help="Roboflow workflow ID -- only used if --roboflow-model-id is empty. Note a Workflow's model reference is pinned separately from the project's 'Current Model' setting and can silently lag behind after retraining")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for NMS")
     parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path (boxes/labels/trajectory baked in -- for review, not training)")
     parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training")
@@ -1126,6 +1152,7 @@ def main():
         roboflow_api_url=args.roboflow_api_url,
         roboflow_api_key=args.roboflow_api_key,
         roboflow_workspace_name=args.roboflow_workspace,
+        roboflow_model_id=args.roboflow_model_id,
         roboflow_workflow_id=args.roboflow_workflow_id,
     )
     print(f"[Device] Running inference on: {tracker.device}")
