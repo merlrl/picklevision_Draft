@@ -421,12 +421,22 @@ class PickleVisionTracker:
 
         Bridges brief detection gaps (typically motion blur at high ball speed) so the
         trajectory and bounce logic don't reset on every single missed frame.
+
+        Decayed rather than a pure straight line: predicted points get appended
+        back into primary_trajectory, so each successive prediction's own step
+        is already `decay` times the previous one, geometrically shrinking the
+        step size on its own (d, d*0.7, d*0.7^2, ...). A genuinely lost ball
+        (stopped, bounced, left frame) settles near its last known position
+        instead of flying off in a straight line for the full max_missed_frames
+        window -- observed live drifting far enough to land on an unrelated
+        person by the time that window ran out, under the old undamped version.
         """
         if len(self.primary_trajectory) < 2 or self.missed_frames > self.max_missed_frames:
             return None
 
         (x1, y1), (x2, y2) = self.primary_trajectory[-2], self.primary_trajectory[-1]
-        return (2 * x2 - x1, 2 * y2 - y1)
+        decay = 0.7
+        return (x2 + (x2 - x1) * decay, y2 + (y2 - y1) * decay)
 
     def _handle_missed_detection(self, frame):
         self.missed_frames += 1
