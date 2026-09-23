@@ -247,6 +247,19 @@ class PickleVisionTracker:
         self.primary_trajectory: list[tuple[float, float]] = []
         self.missed_frames = 0
 
+        # Internal bookkeeping IDs (primary_track_id) can legitimately change
+        # every single frame for the Roboflow backend -- IDs are deliberately
+        # never reused there (see _process_frame_roboflow) to stop the "same ID
+        # still present" fast path from ever falsely matching. That's correct
+        # internally but confusing displayed on screen: a genuinely continuous
+        # ball would show a new "Ball ID" every frame. display_track_id is the
+        # user-facing identity instead -- it only advances when a NEW logical
+        # lock begins (the "no active lock yet" branch in
+        # _select_primary_detection), staying constant through every fast-path
+        # or position-matched continuation of the same lock.
+        self.display_track_id: int | None = None
+        self._next_display_id = 1
+
         # Color check (HSV) to distinguish the pickleball's optic yellow-green from
         # other round objects YOLO's generic "sports ball" class also matches.
         self.ball_color_lower = np.array(ball_color_lower, dtype=np.uint8)
@@ -468,7 +481,11 @@ class PickleVisionTracker:
         else:
             best_idx = int(candidate_pool[0])
         box = boxes[best_idx]
-        print(f"[Ball Lock] Acquired: box={box}, conf={confs[best_idx] if confs is not None and len(confs) else 'n/a'}, color_ratio={self._ball_color_ratio(frame, box):.2f}")
+        # A genuinely new logical lock is starting -- this is the only place
+        # display_track_id should advance (see its definition in __init__).
+        self.display_track_id = self._next_display_id
+        self._next_display_id += 1
+        print(f"[Ball Lock] Acquired: box={box}, conf={confs[best_idx] if confs is not None and len(confs) else 'n/a'}, color_ratio={self._ball_color_ratio(frame, box):.2f}, display_id={self.display_track_id}")
         return box, ids[best_idx]
 
     def _predict_primary_position(self):
@@ -499,6 +516,7 @@ class PickleVisionTracker:
         if predicted_point is None:
             self.primary_track_id = None
             self.primary_trajectory = []
+            self.display_track_id = None
             return frame
 
         if self.exclude_people and self._point_in_any_box(predicted_point, self._detect_people(frame)):
@@ -506,14 +524,15 @@ class PickleVisionTracker:
             # as genuinely lost rather than displaying a marker sitting on someone.
             self.primary_track_id = None
             self.primary_trajectory = []
+            self.display_track_id = None
             return frame
 
         px, py = predicted_point
         predicted_box = (px - 10, py - 10, px + 10, py + 10)
-        self._draw_primary_tracking(frame, predicted_box, self.primary_track_id, predicted=True)
+        self._draw_primary_tracking(frame, predicted_box, predicted=True)
         return frame
 
-    def _draw_primary_tracking(self, frame, box, track_id, predicted=False):
+    def _draw_primary_tracking(self, frame, box, predicted=False):
         x1, y1, x2, y2 = box
         center_x, center_y = self._get_ball_centroid(box)
 
@@ -528,7 +547,7 @@ class PickleVisionTracker:
             self.events.append(
                 BallEvent(
                     frame_index=self.frame_index,
-                    track_id=track_id,
+                    track_id=self.display_track_id,
                     centroid=(center_x, center_y),
                     velocity=velocity,
                     landing_point=landing_point,
@@ -538,7 +557,7 @@ class PickleVisionTracker:
             )
 
         box_color = (0, 165, 255) if predicted else (0, 255, 0)
-        label = f"Ball ID: {track_id}" + (" (predicted)" if predicted else "")
+        label = f"Ball ID: {self.display_track_id}" + (" (predicted)" if predicted else "")
         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), box_color, 2)
         cv2.putText(
             frame,
@@ -717,7 +736,7 @@ class PickleVisionTracker:
         box, track_id = selection
         self.primary_track_id = track_id
         self.missed_frames = 0
-        self._draw_primary_tracking(detect_frame, box, track_id, predicted=False)
+        self._draw_primary_tracking(detect_frame, box, predicted=False)
         return detect_frame
 
     def _process_frame_ultralytics(self, detect_frame):
@@ -755,7 +774,7 @@ class PickleVisionTracker:
             box, track_id = selection
             self.primary_track_id = track_id
             self.missed_frames = 0
-            self._draw_primary_tracking(detect_frame, box, track_id, predicted=False)
+            self._draw_primary_tracking(detect_frame, box, predicted=False)
             return detect_frame
 
         filtered_boxes = result.boxes.xyxy.cpu().numpy()
