@@ -135,6 +135,7 @@ class PickleVisionTracker:
         model_name: str = "yolov8n.pt",
         tracker_config: str = "bytetrack.yaml",
         conf: float = 0.25,
+        reacquire_conf: float = 0.1,
         iou: float = 0.5,
         imgsz: int = 640,
         device: str | None = None,
@@ -214,6 +215,14 @@ class PickleVisionTracker:
 
         self.tracker_config = tracker_config
         self.conf = conf
+        # Used only to reconfirm an ALREADY-tracked ball near its last known
+        # position (see _confidence_floor) -- spatial distance-matching there
+        # validates a weak detection, so a low-confidence-but-nearby candidate
+        # during blur is more useful accepted than discarded, forcing a fall
+        # back to pure motion-blur prediction (or a full lock reset) instead.
+        # Fresh acquisition (no active lock, no spatial prior) still requires
+        # the full `conf` -- see _confidence_floor.
+        self.reacquire_conf = reacquire_conf
         self.iou = iou
         self.imgsz = imgsz
         self.target_class_id = target_class_id
@@ -281,6 +290,16 @@ class PickleVisionTracker:
         center_x = (x1 + x2) / 2.0
         center_y = (y1 + y2) / 2.0
         return center_x, center_y
+
+    def _confidence_floor(self):
+        """Minimum detection confidence to consider, given current lock state.
+
+        An active lock has a spatial prior (primary_trajectory) to validate a
+        candidate against in _select_primary_detection, so a weaker detection
+        near the expected position is worth considering there. Fresh
+        acquisition has no such prior, so it still requires the full `conf`.
+        """
+        return self.reacquire_conf if self.primary_trajectory else self.conf
 
     def _estimate_velocity(self, track_points):
         if len(track_points) < 2:
@@ -709,11 +728,12 @@ class PickleVisionTracker:
         same as it would for a lost-then-reacquired ByteTrack ID.
         """
         predictions = self._fetch_roboflow_predictions(detect_frame)
-        # self.conf is applied here explicitly -- Roboflow's own internal
-        # threshold is a separate setting configured in its UI, not something
-        # this call controls, so low-confidence noise isn't otherwise
-        # guaranteed to be filtered out.
-        predictions = [p for p in predictions if p.get("confidence", 0.0) >= self.conf]
+        # A confidence floor is applied here explicitly -- Roboflow's own
+        # internal threshold is a separate setting configured in its UI, not
+        # something this call controls, so low-confidence noise isn't
+        # otherwise guaranteed to be filtered out. See _confidence_floor for
+        # why this is lower while a lock is already active.
+        predictions = [p for p in predictions if p.get("confidence", 0.0) >= self._confidence_floor()]
         if not predictions:
             return self._handle_missed_detection(detect_frame)
 
@@ -740,11 +760,15 @@ class PickleVisionTracker:
         return detect_frame
 
     def _process_frame_ultralytics(self, detect_frame):
+        # See _confidence_floor -- lower while a lock is already active, so a
+        # weak-but-spatially-consistent detection during blur can still be
+        # used for reconfirmation instead of being discarded before we even
+        # see it.
         results = self.model.track(
             detect_frame,
             persist=True,
             tracker=self.tracker_config,
-            conf=self.conf,
+            conf=self._confidence_floor(),
             iou=self.iou,
             imgsz=self.imgsz,
             verbose=False,
@@ -956,7 +980,8 @@ def parse_args():
     parser.add_argument("--source", type=str, default="0", help="Video file path or USB camera index (default: 0)")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLOv8 model to load")
     parser.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tracking configuration")
-    parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold required to acquire a FRESH lock (no ball currently tracked)")
+    parser.add_argument("--reacquire-conf", type=float, default=0.1, help="Lower confidence threshold used only to reconfirm an ALREADY-tracked ball near its last known position -- spatial matching validates the weaker detection, so it's not treated as risky as accepting a fresh low-confidence detection blind")
     parser.add_argument("--target-class-id", type=int, default=32, help="Class ID to track (default 32 = COCO 'sports ball', for yolov8n.pt). A custom single-class Roboflow model almost always uses class 0 instead -- pass --target-class-id 0 when using one. Use -1 to track every detected class")
     parser.add_argument("--use-roboflow", action="store_true", help="Detect via a Roboflow Workflow on a self-hosted inference server instead of a local Ultralytics model -- for a custom-trained model when weights export isn't available on the Roboflow plan")
     parser.add_argument("--roboflow-api-url", type=str, default="http://localhost:9001", help="Self-hosted Roboflow inference server URL")
@@ -1286,6 +1311,7 @@ def main():
         model_name=args.model,
         tracker_config=args.tracker,
         conf=args.conf,
+        reacquire_conf=args.reacquire_conf,
         iou=args.iou,
         court_mapper=court_mapper,
         target_fps=args.fps,
