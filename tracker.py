@@ -162,6 +162,7 @@ class PickleVisionTracker:
         roboflow_model_id: str | None = None,
         roboflow_workflow_id: str | None = None,
         roboflow_infer_size: int = 640,
+        exclude_people: bool = True,
     ) -> None:
         # Two mutually exclusive detection backends: a local Ultralytics model
         # (default), or a Roboflow model/Workflow running on a self-hosted
@@ -196,6 +197,20 @@ class PickleVisionTracker:
             self.model = YOLO(model_name)
             self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
             self.model.to(self.device)
+
+        # A player wearing ball-colored clothing can pass both the color and
+        # shape/size filters and get mistaken for the ball -- especially during
+        # position-based re-acquisition or motion-blur prediction, which have no
+        # other way to know a candidate/predicted point is sitting on a person.
+        # Runs a small, fast local person detector alongside whichever backend
+        # is doing ball detection (cheap: ~10-15ms on this GPU, per the earlier
+        # ~90fps single-stream benchmark) to reject any such candidate outright.
+        self.exclude_people = exclude_people and YOLO is not None
+        self.person_model = None
+        if self.exclude_people:
+            person_device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.person_model = YOLO("yolov8n.pt")
+            self.person_model.to(person_device)
 
         self.tracker_config = tracker_config
         self.conf = conf
@@ -344,6 +359,27 @@ class PickleVisionTracker:
         mask = cv2.inRange(hsv, self.ball_color_lower, self.ball_color_upper)
         return float(np.count_nonzero(mask)) / mask.size
 
+    def _detect_people(self, frame):
+        """Bounding boxes of people in `frame`, used to reject ball candidates
+        (or drifting motion-blur predictions) that land on a person -- clothing
+        color/shape alone can't tell a player wearing ball-colored gear apart
+        from the real ball.
+        """
+        if self.person_model is None:
+            return []
+        results = self.person_model.predict(frame, classes=[0], conf=0.3, verbose=False)
+        if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+            return []
+        return results[0].boxes.xyxy.cpu().numpy().tolist()
+
+    @staticmethod
+    def _point_in_any_box(point, boxes):
+        px, py = point
+        for x1, y1, x2, y2 in boxes:
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                return True
+        return False
+
     def _is_plausible_ball_shape(self, box):
         """Reject boxes too small or too non-square to plausibly be a round ball.
 
@@ -360,12 +396,29 @@ class PickleVisionTracker:
         return aspect_ratio >= self.min_aspect_ratio
 
     def _narrow_candidate_pool(self, frame, boxes):
-        """Progressively filter candidates by shape, then color, falling back to a
-        looser stage whenever a stricter one eliminates everything -- so a real
-        ball lacking a strong color match (e.g. mostly in shadow) still gets
-        considered via shape alone, rather than the filter silently doing nothing.
+        """Progressively filter candidates by person-exclusion, shape, then color.
+
+        Shape and color fall back to a looser stage whenever a stricter one
+        eliminates everything -- so a real ball lacking a strong color match
+        (e.g. mostly in shadow) still gets considered via shape alone, rather
+        than the filter silently doing nothing. Person-exclusion is a hard
+        filter with no such fallback: if every remaining candidate overlaps a
+        detected person, none of them should be trusted as the ball, so an
+        empty pool is the correct result, not something to loosen.
         """
         all_indices = np.arange(len(boxes))
+
+        if self.exclude_people:
+            person_boxes = self._detect_people(frame)
+            if person_boxes:
+                all_indices = np.array(
+                    [i for i in all_indices if not self._point_in_any_box(self._get_ball_centroid(boxes[i]), person_boxes)],
+                    dtype=int,
+                )
+
+        if len(all_indices) == 0:
+            return all_indices
+
         shape_matches = np.array([i for i in all_indices if self._is_plausible_ball_shape(boxes[i])])
         pool = shape_matches if len(shape_matches) else all_indices
 
@@ -395,6 +448,8 @@ class PickleVisionTracker:
             return boxes[idx], ids[idx]
 
         candidate_pool = self._narrow_candidate_pool(frame, boxes)
+        if len(candidate_pool) == 0:
+            return None
 
         if self.primary_trajectory:
             last_point = np.array(self.primary_trajectory[-1])
@@ -442,6 +497,13 @@ class PickleVisionTracker:
         self.missed_frames += 1
         predicted_point = self._predict_primary_position()
         if predicted_point is None:
+            self.primary_track_id = None
+            self.primary_trajectory = []
+            return frame
+
+        if self.exclude_people and self._point_in_any_box(predicted_point, self._detect_people(frame)):
+            # The decayed prediction has drifted onto a detected person -- treat
+            # as genuinely lost rather than displaying a marker sitting on someone.
             self.primary_track_id = None
             self.primary_trajectory = []
             return frame
@@ -896,6 +958,7 @@ def parse_args():
     parser.add_argument("--max-missed-frames", type=int, default=15, help="Frames to keep extrapolating the ball's position through a detection gap (e.g. motion blur) before dropping the track")
     parser.add_argument("--match-distance", type=float, default=250.0, help="Max pixel distance a new detection can be from the ball's last known position to be accepted as the same ball")
     parser.add_argument("--no-color-filter", action="store_true", help="Disable the optic yellow-green color check used to prefer the real ball over other round objects")
+    parser.add_argument("--no-exclude-people", action="store_true", help="Disable rejecting ball candidates/predictions that land on a detected person (e.g. a player wearing ball-colored clothing). Runs a small local person detector alongside the main detection backend")
     parser.add_argument("--ball-color-min-ratio", type=float, default=0.20, help="Minimum fraction of a candidate box that must be ball-colored to pass the color filter (default 0.20 -- kept fairly loose since the ball's own dimples/holes mean even a correct box is never near-100%% solid color). Lower this if the real ball is being rejected; raise it if other yellow-ish objects (logos, skin, etc.) are being mistaken for the ball")
     parser.add_argument("--min-box-dimension", type=int, default=20, help="Reject candidate boxes smaller than this (pixels, in the detection frame) as implausibly small to be the actual ball -- catches things like a single dimple/hole on the ball's own surface")
     parser.add_argument("--min-aspect-ratio", type=float, default=0.6, help="Reject candidate boxes whose width:height ratio isn't roughly square (min(w,h)/max(w,h) below this) -- a round ball's box should be close to 1:1")
@@ -1212,6 +1275,7 @@ def main():
         max_missed_frames=args.max_missed_frames,
         max_match_distance=args.match_distance,
         require_ball_color=not args.no_color_filter,
+        exclude_people=not args.no_exclude_people,
         ball_color_min_ratio=args.ball_color_min_ratio,
         min_box_dimension=args.min_box_dimension,
         min_aspect_ratio=args.min_aspect_ratio,
