@@ -1034,7 +1034,7 @@ def _court_reference_lines(mapper: CourtMapper):
     return [(tuple(pair[0]), tuple(pair[1])) for pair in mapped]
 
 
-def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0, flip_horizontal=False, flip_vertical=False):
+def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0, flip_horizontal=False, flip_vertical=False, target_width: int = 1920, target_height: int = 1080, target_fps: int = 120):
     """Interactively click the court's 4 real-world corners on a live camera feed.
 
     Click order matters -- it must match CourtMapper's default destination
@@ -1056,6 +1056,19 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
     cap = _open_camera(video_source)
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open source: {source}")
+
+    # Must match run_video's camera config exactly -- calibrating against a
+    # different resolution/FOV than the one actually used for tracking makes
+    # every clicked corner meaningless, since USB cameras commonly change their
+    # field of view (not just scale) between resolution/codec modes.
+    if isinstance(video_source, int):
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+        cap.set(cv2.CAP_PROP_FPS, target_fps)
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"[Camera Config] Requesting {target_width}x{target_height} @ {target_fps}fps (MJPEG) -> got {actual_width}x{actual_height}")
 
     clicked: list[tuple[int, int]] = []
 
@@ -1164,6 +1177,9 @@ def main():
             court_length=args.court_length,
             flip_horizontal=args.flip_horizontal,
             flip_vertical=args.flip_vertical,
+            target_width=args.width,
+            target_height=args.height,
+            target_fps=args.fps,
         )
         return
 
