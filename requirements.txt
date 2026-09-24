@@ -1,9 +1,24 @@
-# torch/torchvision need the CUDA build for GPU inference (the plain PyPI wheel is CPU-only).
-# Install these two FIRST and separately:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-# Then install the rest of this file normally.
-torch==2.6.0+cu124
-torchvision==0.21.0+cu124
+# Tested on Windows 11, Python 3.12, NVIDIA RTX 4060 Laptop (driver 616.92).
+# No CUDA Toolkit or cuDNN install needed -- the NVIDIA libraries come from pip.
+#
+# Install in this order (inference drags the CPU-only onnxruntime back in, which
+# overwrites the GPU build, so the GPU build must go on LAST):
+#   pip install -r requirements.txt
+#   pip uninstall -y onnxruntime
+#   pip install "onnxruntime-gpu[cuda,cudnn]==1.21.1" nvidia-cudnn-cu12==9.7.1.26
+#   pip install tensorrt-cu12-libs==10.8.0.43        # optional: TensorRT FP16
+#
+# With TensorRT installed, tracker.py uses it automatically. The FIRST launch
+# builds an optimized engine for the GPU (~4-5 min, once); later launches
+# reuse it (~17s). 10.8 matches what onnxruntime-gpu 1.21 was built against.
+# Set PICKLEVISION_TENSORRT=0 to run on plain CUDA instead.
+#
+# `pip check` will then say "inference requires onnxruntime, which is not
+# installed" -- harmless, onnxruntime-gpu provides the same module.
+#
+# onnxruntime-gpu is pinned to 1.21.1 because inference 1.5.2 requires <1.22.
+# cuDNN is pinned to 9.7 because onnxruntime-gpu 1.21 fails with newer cuDNN
+# ("Failed to initialize CUDNN Frontend") and silently falls back to CPU.
 
 opencv-python==4.12.0.88
 numpy==2.2.6
@@ -12,3 +27,8 @@ inference==1.5.2
 inference-sdk==1.5.2
 ultralytics==8.4.146
 lap==0.5.13
+
+# CPU build, the version pip resolved alongside inference (tested). Only used by
+# the generic yolov8n.pt path and the optional person filter, not --roboflow-local.
+torch==2.14.0
+torchvision==0.29.0

@@ -1,6 +1,12 @@
 import argparse
 import os
 import time
+
+# Reference point for --stats "startup time" (launch -> first tracked frame),
+# taken before the heavy imports below so their load time is included.
+_PROCESS_START = time.perf_counter()
+
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,10 +16,68 @@ from pathlib import Path
 # advertised mode before returning. Must be set before any VideoCapture call.
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 
+# Where --roboflow-local caches downloaded Roboflow weights. inference's own
+# default is "/tmp/cache", which on Windows lands in C:\tmp\cache -- keep it
+# next to this script instead. Once cached, the model loads with no network.
+# Must be set before importing inference, which reads it at import time.
+os.environ.setdefault("MODEL_CACHE_DIR", str(Path(__file__).resolve().parent / "model_cache"))
+# Only a single detection model is used from inference -- skip its version
+# check (a network call, unwanted offline) and the unused core models that
+# otherwise print a startup warning each. Only CUDA/CPU are ever available on
+# this Windows setup, so don't also probe (and warn about) OpenVINO/CoreML.
+os.environ.setdefault("DISABLE_VERSION_CHECK", "True")
+os.environ.setdefault("CORE_MODEL_GAZE_ENABLED", "False")
+os.environ.setdefault("CORE_MODEL_SAM_ENABLED", "False")
+os.environ.setdefault("CORE_MODEL_SAM3_ENABLED", "False")
+for _flag in (
+    "PALIGEMMA_ENABLED", "FLORENCE2_ENABLED", "QWEN_2_5_ENABLED", "QWEN_3_ENABLED", "SMOLVLM2_ENABLED",
+    "DEPTH_ESTIMATION_ENABLED", "MOONDREAM2_ENABLED", "CORE_MODEL_TROCR_ENABLED",
+    "CORE_MODEL_GROUNDINGDINO_ENABLED", "CORE_MODEL_PE_ENABLED",
+):
+    os.environ.setdefault(_flag, "False")
+
+# TensorRT (FP16), when its pip libraries (tensorrt-cu12-libs) are installed:
+# benchmarked on an RTX 4060 Laptop at 6.7 -> 3.1 ms for the model itself,
+# 12.5 -> 10.5 ms per full tracker frame. Its DLLs must be on PATH before
+# onnxruntime loads its TensorRT provider. onnxruntime falls back to CUDA if
+# TensorRT fails. Set PICKLEVISION_TENSORRT=0 to skip it.
+_TENSORRT_ENABLED = False
+if os.environ.get("PICKLEVISION_TENSORRT", "1") != "0":
+    import importlib.util
+
+    _trt_spec = importlib.util.find_spec("tensorrt_libs")
+    if _trt_spec is not None and _trt_spec.submodule_search_locations:
+        _trt_dir = list(_trt_spec.submodule_search_locations)[0]
+        os.environ["PATH"] = _trt_dir + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(_trt_dir)
+        _TENSORRT_ENABLED = True
+os.environ.setdefault(
+    "ONNXRUNTIME_EXECUTION_PROVIDERS",
+    "[TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider]"
+    if _TENSORRT_ENABLED
+    else "[CUDAExecutionProvider,CPUExecutionProvider]",
+)
+# Deprecation notices from libraries inference imports internally, not from this code.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
+
 import cv2
 import numpy as np
 import supervision as sv
 import torch
+
+# onnxruntime-gpu (what --roboflow-local runs on for the GPU) doesn't find the
+# pip-installed NVIDIA CUDA/cuDNN DLLs on Windows by itself -- load them
+# explicitly before inference creates its session. No-op on CPU-only onnxruntime.
+try:
+    import onnxruntime
+
+    if "CUDAExecutionProvider" in onnxruntime.get_available_providers():
+        onnxruntime.preload_dlls()
+except (ImportError, AttributeError):
+    pass
+
 from inference import get_model
 from inference_sdk import InferenceHTTPClient
 
@@ -33,6 +97,249 @@ def _open_camera(index_or_path):
     if isinstance(index_or_path, int) and os.name == "nt":
         return cv2.VideoCapture(index_or_path, cv2.CAP_MSMF)
     return cv2.VideoCapture(index_or_path)
+
+
+class _FrameReader:
+    """Reads (and MJPEG-decodes) frames on a background thread.
+
+    Decoding is CPU work that otherwise runs in series with detection on the
+    main loop -- ~8ms/frame at 1080p, a third of the whole frame budget. On a
+    thread it overlaps with detection of the previous frame instead.
+
+    live=True (a camera) keeps only the newest frame: if detection falls
+    behind, stale frames are dropped so what's processed is always current.
+    live=False (a video file) queues every frame, blocking the reader when
+    the queue is full, so offline evaluation never skips a frame.
+    """
+
+    def __init__(self, cap, live, queue_size=4):
+        import queue
+        import threading
+
+        self.cap = cap
+        self.live = live
+        self._queue = queue.Queue(maxsize=1 if live else queue_size)
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        import queue
+
+        while not self._stopped.is_set():
+            ok, frame = self.cap.read()
+            # Arrival time rides along with the frame, so --stats can measure
+            # latency from capture to tracked, queue wait included.
+            item = (frame, time.perf_counter()) if ok else (None, None)
+            if self.live:
+                try:
+                    self._queue.get_nowait()  # drop the stale frame, if any
+                except queue.Empty:
+                    pass
+                self._queue.put(item)
+            else:
+                while not self._stopped.is_set():
+                    try:
+                        self._queue.put(item, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+            if not ok:
+                return
+
+    def read(self):
+        """Next (frame, arrival_time), or (None, None) once the source is exhausted/failed."""
+        return self._queue.get()
+
+    def stop(self):
+        self._stopped.set()
+        self._thread.join(timeout=1.0)
+
+
+class _FrameDisplay:
+    """Shows the newest annotated frame from a background thread, at most max_fps.
+
+    imshow + waitKey on Windows benchmarked at 5-14 ms per call -- more than
+    the whole detection step -- and cut end-to-end throughput roughly in half
+    when done on every frame of the main loop. Here tracking never waits on
+    the window: it hands over its latest frame and moves on, and the window
+    repaints at a steady rate (60 fps is already smoother than the eye needs
+    for a preview). The window is created, drawn, and destroyed all on this
+    one thread, as HighGUI requires.
+    """
+
+    def __init__(self, window_name, width, height, max_fps=60):
+        import threading
+
+        self._window_name = window_name
+        self._size = (width, height)
+        self._interval = 1.0 / max_fps
+        self._latest = None
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self.quit_requested = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def show(self, frame):
+        with self._lock:
+            self._latest = frame
+
+    def _run(self):
+        cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self._window_name, *self._size)
+        try:
+            while not self._stopped.is_set():
+                started = time.perf_counter()
+                with self._lock:
+                    frame, self._latest = self._latest, None
+                if frame is not None:
+                    cv2.imshow(self._window_name, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    self.quit_requested.set()
+                remaining = self._interval - (time.perf_counter() - started)
+                if remaining > 0:
+                    time.sleep(remaining)
+        finally:
+            cv2.destroyAllWindows()
+
+    def stop(self):
+        self._stopped.set()
+        self._thread.join(timeout=2.0)
+
+
+class _SessionStats:
+    """--stats: performance and resource log for one tracking session.
+
+    Records startup time (launch -> first tracked frame), and once a second:
+    processed FPS, frame latency (camera arrival -> tracking done, avg and
+    max), CPU and RAM use, and GPU utilization/temperature/power/VRAM via
+    NVIDIA's NVML. Every sample goes to a CSV; a line is printed every 5 s and
+    a summary at the end. CPU temperature isn't included -- Windows exposes no
+    reliable non-admin API for it (use HWiNFO alongside if it's needed).
+    """
+
+    def __init__(self, csv_path):
+        import csv
+
+        import psutil
+
+        self._psutil = psutil
+        self._proc = psutil.Process()
+        self._proc.cpu_percent(None)  # first call only primes the counters
+        psutil.cpu_percent(None)
+        self._nvml = self._gpu = None
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            self._nvml, self._gpu = pynvml, pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            print("[Stats] NVIDIA GPU monitoring unavailable -- GPU columns will be empty")
+
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_path = csv_path
+        self._file = open(csv_path, "w", newline="")
+        self._csv = csv.writer(self._file)
+        self._csv.writerow([
+            "time", "elapsed_s", "fps", "latency_avg_ms", "latency_max_ms", "cpu_system_pct",
+            "cpu_tracker_pct", "ram_tracker_mb", "ram_system_pct", "gpu_util_pct", "gpu_temp_c",
+            "gpu_power_w", "gpu_mem_mb",
+        ])
+
+        self.startup_s = None
+        self._all_latencies: list[float] = []
+        self._window: list[float] = []
+        self._rows: list[dict] = []
+        self._session_start = self._window_start = self._last_print = time.perf_counter()
+
+    def frame_done(self, arrived_at):
+        now = time.perf_counter()
+        if self.startup_s is None:
+            self.startup_s = now - _PROCESS_START
+            print(f"[Stats] Startup time (launch -> first tracked frame): {self.startup_s:.1f}s")
+            self._session_start = self._window_start = self._last_print = now
+        latency = (now - arrived_at) * 1000
+        self._window.append(latency)
+        self._all_latencies.append(latency)
+        if now - self._window_start >= 1.0:
+            self._sample(now)
+
+    def _gpu_reading(self):
+        if self._gpu is None:
+            return None, None, None, None
+        n = self._nvml
+        try:
+            return (
+                n.nvmlDeviceGetUtilizationRates(self._gpu).gpu,
+                n.nvmlDeviceGetTemperature(self._gpu, n.NVML_TEMPERATURE_GPU),
+                round(n.nvmlDeviceGetPowerUsage(self._gpu) / 1000, 1),
+                round(n.nvmlDeviceGetMemoryInfo(self._gpu).used / 2**20),
+            )
+        except Exception:
+            return None, None, None, None
+
+    def _sample(self, now):
+        window_s = now - self._window_start
+        gpu_util, gpu_temp, gpu_power, gpu_mem = self._gpu_reading()
+        row = {
+            "fps": len(self._window) / window_s,
+            "lat_avg": float(np.mean(self._window)),
+            "lat_max": float(np.max(self._window)),
+            "cpu_sys": self._psutil.cpu_percent(None),
+            # Normalized to the whole CPU (psutil reports per-core, up to N*100%).
+            "cpu_proc": self._proc.cpu_percent(None) / (self._psutil.cpu_count() or 1),
+            "ram_proc": self._proc.memory_info().rss / 2**20,
+            "ram_sys": self._psutil.virtual_memory().percent,
+            "gpu_util": gpu_util, "gpu_temp": gpu_temp, "gpu_power": gpu_power, "gpu_mem": gpu_mem,
+        }
+        self._rows.append(row)
+        self._csv.writerow([
+            time.strftime("%Y-%m-%d %H:%M:%S"), round(now - self._session_start, 1), round(row["fps"], 1),
+            round(row["lat_avg"], 2), round(row["lat_max"], 2), row["cpu_sys"], round(row["cpu_proc"], 1),
+            round(row["ram_proc"]), row["ram_sys"], gpu_util, gpu_temp, gpu_power, gpu_mem,
+        ])
+        self._file.flush()
+        if now - self._last_print >= 5.0:
+            gpu = f" | GPU {gpu_util}% {gpu_temp}C {gpu_power}W" if gpu_temp is not None else ""
+            print(
+                f"[Stats] {row['fps']:.0f} fps | latency avg {row['lat_avg']:.1f} ms, max {row['lat_max']:.1f} ms"
+                f" | CPU {row['cpu_sys']:.0f}% | RAM {row['ram_proc']:.0f} MB{gpu}"
+            )
+            self._last_print = now
+        self._window = []
+        self._window_start = now
+
+    def close(self):
+        now = time.perf_counter()
+        if self._window and now - self._window_start > 0.2:
+            self._sample(now)
+        self._file.close()
+        if self._all_latencies:
+            lat = np.array(self._all_latencies)
+            duration = now - self._session_start
+
+            def column(key):
+                return [r[key] for r in self._rows if r[key] is not None]
+
+            temps = column("gpu_temp")
+            print("\n[Stats] ===== Session summary =====")
+            print(f"[Stats] Startup time: {self.startup_s:.1f}s")
+            print(f"[Stats] Frames tracked: {len(lat)} in {duration:.0f}s (avg {len(lat) / duration:.1f} fps)")
+            print(f"[Stats] Latency: avg {lat.mean():.1f} ms, 95th pct {np.percentile(lat, 95):.1f} ms, max {lat.max():.1f} ms")
+            if self._rows:
+                print(f"[Stats] CPU (system): avg {np.mean(column('cpu_sys')):.0f}%, peak {max(column('cpu_sys')):.0f}%")
+                print(f"[Stats] RAM (tracker): peak {max(column('ram_proc')):.0f} MB")
+            if temps:
+                print(f"[Stats] GPU: avg {np.mean(column('gpu_util')):.0f}% util, temp avg {np.mean(temps):.0f}C / "
+                      f"peak {max(temps)}C, power avg {np.mean(column('gpu_power')):.0f} W")
+            print(f"[Stats] Per-second log: {self.csv_path}")
+        if self._nvml is not None:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -130,6 +437,30 @@ class CourtMapper:
 class PickleVisionTracker:
     """Single-camera draft for Project PickleVision using YOLOv8 detection + tracking."""
 
+    # Per-frame movement (px) up to which a step is treated as detector jitter
+    # and fully smoothed; larger steps are smoothed proportionally less.
+    SMOOTHING_JITTER_PX = 8.0
+    # Fraction of ball_color_min_ratio a candidate still needs when the color
+    # filter falls back to its looser stage (re-acquiring an existing lock).
+    LOOSE_COLOR_FRACTION = 0.25
+    # Static-spot suppression (see _static_candidates): detections are counted
+    # per STATIC_CELL_PX grid cell with STATIC_DECAY per frame; a cell whose
+    # count passes STATIC_THRESHOLD (~30 consecutive frames) is background.
+    STATIC_CELL_PX = 24
+    STATIC_DECAY = 0.97
+    STATIC_THRESHOLD = 20.0
+    # A static candidate is still accepted if it's this close to the tracked
+    # ball's last position -- i.e. the ball being followed has come to rest.
+    STATIC_KEEP_RADIUS_PX = 25.0
+    # Gap prediction (see _fit_motion): how many recent real detections to
+    # fit, the minimum needed to fit at all, and the polynomial degree in y.
+    # Chosen by simulated-gap benchmark (noisy ballistic shots, 5-15 hidden
+    # frames): 10-point gravity fit had the lowest error, ~6-10x below the old
+    # two-point decayed extrapolation.
+    PREDICT_FIT_POINTS = 10
+    PREDICT_MIN_POINTS = 3
+    PREDICT_Y_DEGREE = 2
+
     def __init__(
         self,
         model_name: str = "yolov8n.pt",
@@ -163,7 +494,10 @@ class PickleVisionTracker:
         roboflow_model_id: str | None = None,
         roboflow_workflow_id: str | None = None,
         roboflow_infer_size: int = 640,
+        roboflow_local: bool = False,
         exclude_people: bool = True,
+        smoothing: float = 0.5,
+        bounce_min_dy: float = 3.0,
     ) -> None:
         # Two mutually exclusive detection backends: a local Ultralytics model
         # (default), or a Roboflow model/Workflow running on a self-hosted
@@ -179,11 +513,30 @@ class PickleVisionTracker:
         # Workflow's "Project" block pins its own model version independently of
         # whatever is set as "Current Model" on the project's Deployments page,
         # so it can silently keep serving an old version after retraining.
-        self.use_roboflow = use_roboflow
+        #
+        # roboflow_local runs the same Roboflow model in-process via the
+        # inference package instead of calling a server (no Docker): weights
+        # are downloaded once with the API key into MODEL_CACHE_DIR, then load
+        # from there offline. Only model_id is supported locally, not Workflows.
+        self.use_roboflow = use_roboflow or roboflow_local
+        self.roboflow_local_model = None
         if self.use_roboflow:
             self.model = None
-            self.device = "roboflow-server"
-            self.roboflow_client = InferenceHTTPClient.init(api_url=roboflow_api_url, api_key=roboflow_api_key)
+            if roboflow_local:
+                if not roboflow_model_id:
+                    raise ValueError("--roboflow-local requires --roboflow-model-id (Workflows aren't supported locally)")
+                if _TENSORRT_ENABLED and not any(
+                    Path(os.environ["MODEL_CACHE_DIR"]).glob(f"{roboflow_model_id}/**/*.engine")
+                ):
+                    print(
+                        "[TensorRT] First launch for this model: building an optimized engine for this GPU. "
+                        "This takes about 4-5 minutes once; later launches reuse it."
+                    )
+                self.roboflow_local_model = get_model(model_id=roboflow_model_id, api_key=roboflow_api_key)
+                self.device = "roboflow-local"
+            else:
+                self.device = "roboflow-server"
+                self.roboflow_client = InferenceHTTPClient.init(api_url=roboflow_api_url, api_key=roboflow_api_key)
             self.roboflow_workspace_name = roboflow_workspace_name
             self.roboflow_model_id = roboflow_model_id
             self.roboflow_workflow_id = roboflow_workflow_id
@@ -256,6 +609,24 @@ class PickleVisionTracker:
         self.primary_trajectory: list[tuple[float, float]] = []
         self.missed_frames = 0
 
+        # Detector boxes wobble a few pixels frame-to-frame even on a still
+        # ball. Raw centroids made the drawn path scribble, and that noise fed
+        # straight into velocity/prediction and bounce detection. smoothing is
+        # an exponential moving average weight on the previous point (0 = raw,
+        # closer to 1 = smoother but laggier). bounce_min_dy is the per-frame
+        # vertical movement (px) below which a Y change counts as noise, not a
+        # direction change -- otherwise every wobble registers as a "bounce".
+        self.smoothing = smoothing
+        self.bounce_min_dy = bounce_min_dy
+        self._static_heat: dict[tuple[int, int], float] = {}
+        # Whether the current lock has ever travelled more than
+        # 2 * STATIC_KEEP_RADIUS_PX from where it started -- see _drop_static.
+        self._lock_origin: tuple[float, float] | None = None
+        self._lock_has_moved = False
+        # Raw (unsmoothed) real detections of the current lock as
+        # (frame_index, x, y) -- the input to _fit_motion.
+        self._observations: list[tuple[int, float, float]] = []
+
         # Internal bookkeeping IDs (primary_track_id) can legitimately change
         # every single frame for the Roboflow backend -- IDs are deliberately
         # never reused there (see _process_frame_roboflow) to stop the "same ID
@@ -327,11 +698,16 @@ class PickleVisionTracker:
         # Calculate the change in Y (dy)
         dy = np.diff(y_vals)
 
-        # If the ball was going down (+dy) and suddenly goes up (-dy), it bounced
-        direction_change_y = np.sum(np.sign(dy[:-1]) != np.sign(dy[1:])) > 0
+        # If the ball was going down (+dy) and suddenly goes up (-dy), it bounced.
+        # Steps smaller than bounce_min_dy are detector jitter, not movement, so
+        # they're dropped before comparing directions.
+        signs = np.sign(dy[np.abs(dy) >= self.bounce_min_dy])
+        direction_change_y = np.any(signs[:-1] != signs[1:])
 
-        # Speed drop is a fallback for when a ball rolls or loses momentum near the boundary
-        speed_drop = self._estimate_velocity(recent) < 4.0
+        # Speed drop is a fallback for when a ball rolls or loses momentum near the boundary.
+        # Only the moment it slows counts -- a ball that's simply stationary (held,
+        # resting) would otherwise register as a new "bounce" on every frame.
+        speed_drop = self._estimate_velocity(recent) < 4.0 <= self._estimate_velocity(recent[:-1])
 
         if direction_change_y or speed_drop:
             return recent[-1]
@@ -427,13 +803,17 @@ class PickleVisionTracker:
         aspect_ratio = min(w, h) / max(w, h) if max(w, h) > 0 else 0
         return aspect_ratio >= self.min_aspect_ratio
 
-    def _narrow_candidate_pool(self, frame, boxes):
+    def _narrow_candidate_pool(self, frame, boxes, strict_color=False):
         """Progressively filter candidates by person-exclusion, shape, then color.
 
         Shape and color fall back to a looser stage whenever a stricter one
         eliminates everything -- so a real ball lacking a strong color match
-        (e.g. mostly in shadow) still gets considered via shape alone, rather
-        than the filter silently doing nothing. Person-exclusion is a hard
+        (e.g. mostly in shadow) still gets considered, rather than the filter
+        silently doing nothing (the color fallback still needs a small
+        fraction of ball color, see LOOSE_COLOR_FRACTION). strict_color disables the color
+        fallback: used for fresh acquisition, which has no spatial prior, so a
+        lone non-ball-colored false positive (a wall cable, a curtain edge) would
+        otherwise pass by default and start a bogus lock. Person-exclusion is a hard
         filter with no such fallback: if every remaining candidate overlaps a
         detected person, none of them should be trusted as the ball, so an
         empty pool is the correct result, not something to loosen.
@@ -457,10 +837,57 @@ class PickleVisionTracker:
         if self.require_ball_color:
             color_ratios = np.array([self._ball_color_ratio(frame, boxes[i]) for i in pool])
             color_matches = pool[color_ratios >= self.ball_color_min_ratio]
-            if len(color_matches):
+            if len(color_matches) or strict_color:
                 pool = color_matches
+            else:
+                # Even the looser fallback needs *some* ball color: otherwise
+                # any non-ball junk the model flags near the last position gets
+                # adopted whenever the real ball blurs out for a frame. A
+                # shadowed real ball still keeps a few yellow pixels.
+                pool = pool[color_ratios >= self.ball_color_min_ratio * self.LOOSE_COLOR_FRACTION]
 
         return pool
+
+    def _static_candidates(self, boxes):
+        """Flag detections sitting at a spot that has been detected nearly every frame.
+
+        A ball in play keeps moving; something detected at the same spot for
+        ~30 consecutive frames is background the model mistakes for a distant
+        ball. Observed live: a small yellow object on the floor, detected in
+        26/30 frames at up to 0.47 conf with 24-31% ball color -- indistinguishable
+        from a far-away ball by color, shape, or confidence, only by never moving.
+        Counts decay every call, so a spot stops being "static" once it's gone.
+        """
+        cell = self.STATIC_CELL_PX
+        for key in list(self._static_heat):
+            self._static_heat[key] *= self.STATIC_DECAY
+            if self._static_heat[key] < 0.5:
+                del self._static_heat[key]
+        cells = [(int(cx // cell), int(cy // cell)) for cx, cy in (self._get_ball_centroid(b) for b in boxes)]
+        for key in set(cells):
+            self._static_heat[key] = self._static_heat.get(key, 0.0) + 1.0
+        return np.array([self._static_heat[key] >= self.STATIC_THRESHOLD for key in cells])
+
+    def _drop_static(self, candidate_pool, boxes, static):
+        """Remove static-spot candidates, unless it's the tracked ball itself at rest.
+
+        "Itself at rest" requires the lock to have moved at some point: a lock
+        that has never moved is most likely on background that got grabbed
+        before its spot was recognized as static (e.g. right at startup), and
+        it's dropped here once that happens instead of being kept forever.
+        """
+        if not len(candidate_pool) or not static[candidate_pool].any():
+            return candidate_pool
+        last_point = np.array(self.primary_trajectory[-1]) if self.primary_trajectory and self._lock_has_moved else None
+
+        def keep(i):
+            if not static[i]:
+                return True
+            if last_point is None:
+                return False
+            return np.linalg.norm(np.array(self._get_ball_centroid(boxes[i])) - last_point) <= self.STATIC_KEEP_RADIUS_PX
+
+        return np.array([i for i in candidate_pool if keep(i)], dtype=int)
 
     def _select_primary_detection(self, frame, boxes, ids, confs):
         """Pick exactly one detection to follow so a stray round object never hijacks the ball ID.
@@ -475,11 +902,17 @@ class PickleVisionTracker:
         if not ids:
             return None
 
+        static = self._static_candidates(boxes)
+
         if self.primary_track_id in ids:
             idx = ids.index(self.primary_track_id)
             return boxes[idx], ids[idx]
 
-        candidate_pool = self._narrow_candidate_pool(frame, boxes)
+        # Same asymmetry as _confidence_floor: an active lock's position match
+        # validates a poorly-colored candidate (e.g. ball in shadow), but a
+        # fresh lock has nothing else vouching for it, so color is mandatory.
+        candidate_pool = self._narrow_candidate_pool(frame, boxes, strict_color=not self.primary_trajectory)
+        candidate_pool = self._drop_static(candidate_pool, boxes, static)
         if len(candidate_pool) == 0:
             return None
 
@@ -491,7 +924,28 @@ class PickleVisionTracker:
             if distances[best_idx] <= self.max_match_distance:
                 print(f"[Ball Lock] Re-acquired via position match: box={boxes[best_idx]}, distance={distances[best_idx]:.0f}px")
                 return boxes[best_idx], ids[best_idx]
-            return None
+            if not self.missed_frames:
+                return None
+            # The lock is running on prediction alone, which is exactly when
+            # its position is least trustworthy -- after a fast direction change
+            # the extrapolated point heads the wrong way, and the real ball ends
+            # up beyond max_match_distance of it. Observed live: the ball in
+            # plain view, ignored for the whole prediction window while the
+            # marker drifted across the room. A detection confident enough to
+            # start a fresh lock is trusted over the guess instead.
+            candidate_pool = self._narrow_candidate_pool(frame, boxes, strict_color=True)
+            candidate_pool = self._drop_static(candidate_pool, boxes, static)
+            if confs is not None and len(confs):
+                candidate_pool = candidate_pool[confs[candidate_pool] >= self.conf]
+            if len(candidate_pool) == 0:
+                return None
+            # Drop the stale path so the trail doesn't draw a line back to the
+            # wrong predicted spot. Same ball, so the displayed ID is kept.
+            self.primary_trajectory = []
+            switching = True
+            print("[Ball Lock] Prediction had drifted off the ball; switching to confident detection")
+        else:
+            switching = False
 
         # No active lock yet: acquire whichever plausible-shaped, ball-colored
         # detection the model is most confident about.
@@ -502,16 +956,63 @@ class PickleVisionTracker:
         box = boxes[best_idx]
         # A genuinely new logical lock is starting -- this is the only place
         # display_track_id should advance (see its definition in __init__).
-        self.display_track_id = self._next_display_id
-        self._next_display_id += 1
+        if not switching:
+            self.display_track_id = self._next_display_id
+            self._next_display_id += 1
         print(f"[Ball Lock] Acquired: box={box}, conf={confs[best_idx] if confs is not None and len(confs) else 'n/a'}, color_ratio={self._ball_color_ratio(frame, box):.2f}, display_id={self.display_track_id}")
         return box, ids[best_idx]
 
-    def _predict_primary_position(self):
-        """Extrapolate the ball's position for a few frames using its last known velocity.
+    def _fit_motion(self):
+        """Predict the ball's position at the current frame from a motion fit.
 
-        Bridges brief detection gaps (typically motion blur at high ball speed) so the
-        trajectory and bounce logic don't reset on every single missed frame.
+        Fits the last PREDICT_FIT_POINTS *real* detections (never earlier
+        predictions, so errors don't compound): x linear in time, y a
+        polynomial of degree PREDICT_Y_DEGREE (2 = constant acceleration, i.e.
+        gravity) once there are enough points to fit it. Averaging over several
+        detections instead of differencing the last two keeps detector jitter
+        out of the velocity estimate. Points before the most recent vertical
+        direction reversal (a bounce or a hit) are dropped -- one smooth curve
+        can't span one. Returns None if there isn't enough data to fit.
+        """
+        obs = self._observations[-self.PREDICT_FIT_POINTS:]
+        if len(obs) < self.PREDICT_MIN_POINTS:
+            return None
+        t, xs, ys = (np.array(v, dtype=float) for v in zip(*obs))
+
+        dy = np.diff(ys)
+        moving = np.nonzero(np.abs(dy) >= self.bounce_min_dy)[0]
+        for k in range(len(moving) - 1, 0, -1):
+            if np.sign(dy[moving[k]]) != np.sign(dy[moving[k - 1]]):
+                start = moving[k]
+                t, xs, ys = t[start:], xs[start:], ys[start:]
+                break
+        distinct_times = len(np.unique(t))
+        if distinct_times < 2:
+            return None
+
+        # Time relative to the newest detection keeps polyfit well-conditioned.
+        tt = t - t[-1]
+        target = self.frame_index - t[-1]
+        y_degree = self.PREDICT_Y_DEGREE if distinct_times > self.PREDICT_Y_DEGREE + 2 else 1
+        try:
+            px = np.polyval(np.polyfit(tt, xs, 1), target)
+            py = np.polyval(np.polyfit(tt, ys, y_degree), target)
+        except (np.linalg.LinAlgError, ValueError):
+            # Degenerate input must never take down a live session -- fall
+            # back to the simple extrapolation instead.
+            return None
+        if not (np.isfinite(px) and np.isfinite(py)):
+            return None
+        return float(px), float(py)
+
+    def _predict_primary_position(self):
+        """Extrapolate the ball's position through a detection gap.
+
+        Bridges brief detection gaps (typically motion blur at high ball speed,
+        or occlusion by a player/paddle) so the trajectory and bounce logic
+        don't reset on every single missed frame. Uses _fit_motion whenever the
+        lock has enough real detections; the decayed two-point extrapolation
+        below is only the fallback for a lock too new to fit.
 
         Decayed rather than a pure straight line: predicted points get appended
         back into primary_trajectory, so each successive prediction's own step
@@ -525,6 +1026,10 @@ class PickleVisionTracker:
         if len(self.primary_trajectory) < 2 or self.missed_frames > self.max_missed_frames:
             return None
 
+        fitted = self._fit_motion()
+        if fitted is not None:
+            return fitted
+
         (x1, y1), (x2, y2) = self.primary_trajectory[-2], self.primary_trajectory[-1]
         decay = 0.7
         return (x2 + (x2 - x1) * decay, y2 + (y2 - y1) * decay)
@@ -532,6 +1037,13 @@ class PickleVisionTracker:
     def _handle_missed_detection(self, frame):
         self.missed_frames += 1
         predicted_point = self._predict_primary_position()
+        # A prediction outside the frame means the ball has left the view;
+        # there's nothing left to bridge, so end the lock instead of drawing
+        # a marker pinned to the edge.
+        if predicted_point is not None and not (
+            0 <= predicted_point[0] < frame.shape[1] and 0 <= predicted_point[1] < frame.shape[0]
+        ):
+            predicted_point = None
         if predicted_point is None:
             self.primary_track_id = None
             self.primary_trajectory = []
@@ -554,6 +1066,29 @@ class PickleVisionTracker:
     def _draw_primary_tracking(self, frame, box, predicted=False):
         x1, y1, x2, y2 = box
         center_x, center_y = self._get_ball_centroid(box)
+        raw_x, raw_y = center_x, center_y
+        # Predicted points are already derived from the smoothed trajectory.
+        # Smoothing fades out as the step grows: small steps are detector
+        # jitter and get the full weight, but a big step is real fast movement,
+        # where averaging with the previous point would round off sharp
+        # direction changes and leave the path lagging behind the ball.
+        if self.primary_trajectory and not predicted:
+            prev_x, prev_y = self.primary_trajectory[-1]
+            step = np.hypot(center_x - prev_x, center_y - prev_y)
+            weight = self.smoothing * min(1.0, self.SMOOTHING_JITTER_PX / step) if step > 0 else self.smoothing
+            center_x = weight * prev_x + (1 - weight) * center_x
+            center_y = weight * prev_y + (1 - weight) * center_y
+
+        if not self.primary_trajectory:
+            self._lock_origin = (center_x, center_y)
+            self._lock_has_moved = False
+            self._observations = []
+        elif not predicted and not self._lock_has_moved:
+            travelled = np.hypot(center_x - self._lock_origin[0], center_y - self._lock_origin[1])
+            self._lock_has_moved = travelled > 2 * self.STATIC_KEEP_RADIUS_PX
+        if not predicted:
+            self._observations.append((self.frame_index, raw_x, raw_y))
+            del self._observations[: -self.PREDICT_FIT_POINTS]
 
         self.primary_trajectory.append((center_x, center_y))
         if len(self.primary_trajectory) > self.max_history:
@@ -672,6 +1207,71 @@ class PickleVisionTracker:
             return self._process_frame_roboflow(detect_frame)
         return self._process_frame_ultralytics(detect_frame)
 
+    def _infer_local(self, image, confidence):
+        """Run the local Roboflow model directly on its ONNX session.
+
+        Equivalent to roboflow_local_model.infer() for this model's
+        preprocessing ("Fit (black edges) in" to a square input, RGB, /255) and
+        its NMS-free output (N x [x1, y1, x2, y2, conf, class] in input-space
+        pixels), replicating inference's own resize/padding/rounding steps --
+        but faster: inference's generic path builds a non-contiguous input
+        array (an extra copy before the GPU) and wraps every box in a pydantic
+        object. Checked box-for-box against infer() on real camera frames and
+        screenshots: identical boxes and confidences.
+
+        Falls back to infer() for any model not matching that shape (e.g. after
+        retraining with different preprocessing).
+        """
+        model = self.roboflow_local_model
+        session = getattr(model, "onnx_session", None)
+        if session is None or getattr(model, "resize_method", None) != "Fit (black edges) in":
+            result = model.infer(image, confidence=confidence, iou_threshold=self.iou)[0]
+            return [
+                {"x": p.x, "y": p.y, "width": p.width, "height": p.height, "confidence": p.confidence}
+                for p in result.predictions
+            ]
+
+        in_h, in_w = model.img_size_h, model.img_size_w
+        h, w = image.shape[:2]
+        # Same new-size arithmetic as inference's resize_image_keeping_aspect_ratio.
+        if w / h >= in_w / in_h:
+            new_w, new_h = in_w, int(in_w / (w / h))
+        else:
+            new_w, new_h = int(in_h * (w / h)), in_h
+        resized = image if (new_w, new_h) == (w, h) else cv2.resize(image, (new_w, new_h))
+        top, left = (in_h - new_h) // 2, (in_w - new_w) // 2
+        # Buffers are reused across frames (the black padding never changes
+        # while the frame size doesn't). Filling each RGB plane straight from
+        # the uint8 BGR canvas is bit-identical to cv2.dnn.blobFromImage(...,
+        # 1/255, swapRB=True) but ~4x faster (0.6 vs 2.5 ms benchmarked).
+        key = (in_h, in_w, new_h, new_w)
+        if getattr(self, "_infer_buffers_key", None) != key:
+            self._infer_canvas = np.zeros((in_h, in_w, 3), np.uint8)
+            self._infer_blob = np.empty((1, 3, in_h, in_w), np.float32)
+            self._infer_buffers_key = key
+        canvas, blob = self._infer_canvas, self._infer_blob
+        canvas[top : top + new_h, left : left + new_w] = resized
+        for plane, channel in enumerate((2, 1, 0)):  # BGR -> RGB
+            np.multiply(canvas[:, :, channel], np.float32(1 / 255.0), out=blob[0, plane], casting="unsafe")
+
+        out = session.run(None, {model.input_name: blob})[0][0]
+        out = out[out[:, 4] > confidence]
+        if not len(out):
+            return []
+
+        # Same inverse mapping as inference's undo_image_padding_for_predicted_boxes
+        # + clip_boxes_coordinates (note: round() here vs int() above, as there).
+        scale = min(in_h / h, in_w / w)
+        pad_x = (in_w - round(w * scale)) / 2
+        pad_y = (in_h - round(h * scale)) / 2
+        boxes = out[:, :4].astype(np.float64)
+        boxes[:, [0, 2]] = np.round(np.clip((boxes[:, [0, 2]] - pad_x) / scale, 0, w))
+        boxes[:, [1, 3]] = np.round(np.clip((boxes[:, [1, 3]] - pad_y) / scale, 0, h))
+        return [
+            {"x": (x1 + x2) / 2, "y": (y1 + y2) / 2, "width": x2 - x1, "height": y2 - y1, "confidence": float(c)}
+            for (x1, y1, x2, y2), c in zip(boxes, out[:, 4])
+        ]
+
     def _fetch_roboflow_predictions(self, detect_frame):
         """Get the raw predictions list, preferring a direct model_id call.
 
@@ -695,7 +1295,11 @@ class PickleVisionTracker:
         scale = min(1.0, self.roboflow_infer_size / max(h, w))
         send_frame = cv2.resize(detect_frame, (int(w * scale), int(h * scale))) if scale < 1.0 else detect_frame
 
-        if self.roboflow_model_id:
+        if self.roboflow_local_model is not None:
+            # Ask for everything down to the lowest floor we might use --
+            # _process_frame_roboflow applies the real, lock-dependent floor.
+            predictions = self._infer_local(send_frame, confidence=min(self.conf, self.reacquire_conf))
+        elif self.roboflow_model_id:
             result = self.roboflow_client.infer(send_frame, model_id=self.roboflow_model_id)
             predictions = result.get("predictions", [])
         else:
@@ -806,7 +1410,7 @@ class PickleVisionTracker:
         self._draw_tracking(detect_frame, filtered_boxes, filtered_ids)
         return detect_frame
 
-    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None, record_fps=None, flip_horizontal=False, flip_vertical=False):
+    def run_video(self, source, output_path=None, show_window=True, raw_output_path=None, record_fps=None, flip_horizontal=False, flip_vertical=False, stats_csv=None):
         if isinstance(source, Path):
             video_source = str(source)
         elif isinstance(source, int):
@@ -908,15 +1512,14 @@ class PickleVisionTracker:
             )
             print(f"[Raw Recording] Saving unannotated footage to {raw_output_path} (Roboflow-ready)")
 
-        window_name = "Project PickleVision - Single Camera Draft"
+        display = None
         if show_window:
             # WINDOW_NORMAL makes it resizable/draggable; the initial size is just a
             # display cap so a 1920x1080 capture doesn't overflow a laptop screen --
             # recording and detection still use the full captured (or zoomed) resolution.
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             display_width = min(output_width, 1280)
             display_height = int(display_width * output_height / output_width) if output_width else output_height
-            cv2.resizeWindow(window_name, display_width, display_height)
+            display = _FrameDisplay("Project PickleVision - Single Camera Draft", display_width, display_height)
 
         # Frame-pace the recording to wall-clock time instead of writing one frame
         # per loop iteration. Per-frame processing (detection/tracking/drawing) is
@@ -932,10 +1535,12 @@ class PickleVisionTracker:
         max_catchup_frames_per_iteration = max(1, int(effective_record_fps))
 
 
+        stats = _SessionStats(stats_csv) if stats_csv else None
+        reader = _FrameReader(cap, live=isinstance(video_source, int))
         try:
-            while cap.isOpened():
-                success, frame = cap.read()
-                if not success:
+            while True:
+                frame, arrived_at = reader.read()
+                if frame is None:
                     break
 
                 if flip_horizontal or flip_vertical:
@@ -948,6 +1553,8 @@ class PickleVisionTracker:
                 raw_frame = frame.copy() if raw_writer is not None else None
 
                 annotated = self.process_frame(frame)
+                if stats is not None:
+                    stats.frame_done(arrived_at)
 
                 if writer is not None or raw_writer is not None:
                     expected_frames = int((time.time() - record_start) * effective_record_fps)
@@ -959,18 +1566,21 @@ class PickleVisionTracker:
                             raw_writer.write(raw_frame)
                         frames_written += 1
 
-                if show_window:
-                    cv2.imshow(window_name, annotated)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                if display is not None:
+                    display.show(annotated)
+                    if display.quit_requested.is_set():
                         break
         finally:
+            reader.stop()
             cap.release()
             if writer is not None:
                 writer.release()
             if raw_writer is not None:
                 raw_writer.release()
-            if show_window:
-                cv2.destroyAllWindows()
+            if display is not None:
+                display.stop()
+            if stats is not None:
+                stats.close()
 
         return self.events
 
@@ -984,6 +1594,7 @@ def parse_args():
     parser.add_argument("--reacquire-conf", type=float, default=0.1, help="Lower confidence threshold used only to reconfirm an ALREADY-tracked ball near its last known position -- spatial matching validates the weaker detection, so it's not treated as risky as accepting a fresh low-confidence detection blind")
     parser.add_argument("--target-class-id", type=int, default=32, help="Class ID to track (default 32 = COCO 'sports ball', for yolov8n.pt). A custom single-class Roboflow model almost always uses class 0 instead -- pass --target-class-id 0 when using one. Use -1 to track every detected class")
     parser.add_argument("--use-roboflow", action="store_true", help="Detect via a Roboflow Workflow on a self-hosted inference server instead of a local Ultralytics model -- for a custom-trained model when weights export isn't available on the Roboflow plan")
+    parser.add_argument("--roboflow-local", action="store_true", help="Run the Roboflow model (--roboflow-model-id) in-process on this PC -- no inference server or Docker. Weights download once into ./model_cache using the API key, then load offline")
     parser.add_argument("--roboflow-api-url", type=str, default="http://localhost:9001", help="Self-hosted Roboflow inference server URL")
     parser.add_argument("--roboflow-api-key", type=str, default="ZceKVfYE1Cvm0jqDdA1F", help="Roboflow API key")
     parser.add_argument("--roboflow-workspace", type=str, default="franzs-workspace-utuz0", help="Roboflow workspace name")
@@ -995,11 +1606,15 @@ def parse_args():
     parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training")
     parser.add_argument("--record-fps", type=int, default=None, help="FPS to WRITE recorded video at (default: min(camera fps, 30)). Capture/detection still runs at full --fps; only the saved file rate is lowered, since encoding two full-res streams at 120fps is heavy CPU work")
     parser.add_argument("--show", action="store_true", default=True, help="Display annotated frames in real-time")
-    parser.add_argument("--fps", type=int, default=30, help="Target camera FPS (default: 30; use 120 for ELP camera)")
+    parser.add_argument("--fps", type=int, default=120, help="Target camera FPS (default: 120, for the ELP camera; a camera that can't do it falls back to its own max)")
     parser.add_argument("--width", type=int, default=640, help="Target camera width in pixels (default: 640; use 1920 for ELP camera)")
     parser.add_argument("--height", type=int, default=480, help="Target camera height in pixels (default: 480; use 1080 for ELP camera)")
     parser.add_argument("--court-corners", type=str, default=None, help="Court calibration: x1 y1 x2 y2 x3 y3 x4 y4 (TL TR BR BL)")
     parser.add_argument("--max-missed-frames", type=int, default=15, help="Frames to keep extrapolating the ball's position through a detection gap (e.g. motion blur) before dropping the track")
+    parser.add_argument("--stats", action="store_true", help="Log performance and resources: startup time, fps, frame latency, CPU/RAM, GPU utilization/temperature/power. Prints every 5s plus a summary at the end, and saves a per-second CSV (see --stats-csv)")
+    parser.add_argument("--stats-csv", type=str, default=None, help="CSV path for --stats (default: logs/session_<date>_<time>_cam<source>.csv)")
+    parser.add_argument("--smoothing", type=float, default=0.5, help="Trajectory smoothing, 0-1 (default 0.5). 0 = raw detector positions (jittery); higher = smoother path but lags a fast ball more")
+    parser.add_argument("--bounce-min-dy", type=float, default=3.0, help="Per-frame vertical movement (px) below which a Y change is treated as detector jitter rather than a bounce (default 3)")
     parser.add_argument("--match-distance", type=float, default=250.0, help="Max pixel distance a new detection can be from the ball's last known position to be accepted as the same ball")
     parser.add_argument("--no-color-filter", action="store_true", help="Disable the optic yellow-green color check used to prefer the real ball over other round objects")
     parser.add_argument("--no-exclude-people", action="store_true", help="Disable rejecting ball candidates/predictions that land on a detected person (e.g. a player wearing ball-colored clothing). Runs a small local person detector alongside the main detection backend")
@@ -1336,8 +1951,17 @@ def main():
         roboflow_model_id=args.roboflow_model_id,
         roboflow_workflow_id=args.roboflow_workflow_id,
         roboflow_infer_size=args.roboflow_infer_size,
+        roboflow_local=args.roboflow_local,
+        smoothing=args.smoothing,
+        bounce_min_dy=args.bounce_min_dy,
     )
     print(f"[Device] Running inference on: {tracker.device}")
+    if tracker.roboflow_local_model is not None:
+        # Warm up here so the one-time TensorRT engine build (or CUDA init)
+        # happens before the camera opens, not as a multi-minute freeze on
+        # the first live frame.
+        tracker.roboflow_local_model.infer(np.zeros((args.height, args.width, 3), np.uint8))
+        print(f"[Device] Model backend: {tracker.roboflow_local_model.onnx_session.get_providers()[0]}")
 
     events = tracker.run_video(
         source=source,
@@ -1347,6 +1971,10 @@ def main():
         record_fps=args.record_fps,
         flip_horizontal=args.flip_horizontal,
         flip_vertical=args.flip_vertical,
+        stats_csv=(
+            args.stats_csv
+            or f"logs/session_{time.strftime('%Y%m%d_%H%M%S')}_cam{Path(str(args.source)).stem}.csv"
+        ) if args.stats else None,
     )
     print(f"\n[Summary] Tracked {len(events)} candidate ball events.")
 
