@@ -5,4 +5,6 @@ __pycache__/
 *.onnx
 *.engine
 recordings/
+model_cache/
+logs/
 corners.txt
