@@ -434,6 +434,56 @@ class CourtMapper:
         return "OUT"
 
 
+def to_global_court_point(local_point, camera_end, half_length=22.0):
+    """Convert a point from an END camera's own half-court calibration (local Y
+    in [0, half_length], 0 = net) into one shared GLOBAL full-court coordinate
+    system (global Y in [0, 2*half_length], 0 = end-A baseline, half_length =
+    net, 2*half_length = end-B baseline).
+
+    X is passed through unchanged -- correct ONLY if both end cameras are
+    calibrated against the same physical reference (e.g. both centered on and
+    aligned with the court's centerline, per the team's actual mounting plan).
+    If that assumption doesn't hold (the two cameras' "left" don't agree),
+    check_camera_alignment below is exactly how that shows up: a large X
+    discrepancy between the two cameras' reports of the same real point.
+    """
+    if camera_end not in ("A", "B"):
+        raise ValueError(f"camera_end must be 'A' or 'B', got {camera_end!r}")
+    local_x, local_y = local_point
+    global_y = (half_length - local_y) if camera_end == "A" else (half_length + local_y)
+    return (local_x, global_y)
+
+
+def check_camera_alignment(point_a_local, point_b_local, half_length=22.0, tolerance_ft=2.0):
+    """Compare what the two end cameras each report, in their own local
+    calibration, for what should be the SAME real-world point at the same
+    moment (e.g. a person standing still while both cameras track them, or a
+    synchronized ball position) -- both readings should land on nearly the
+    same GLOBAL court coordinate if the two calibrations genuinely agree.
+
+    Returns a dict with the two points converted to global coordinates, the
+    per-axis and combined discrepancy, and an "aligned" verdict against
+    `tolerance_ft`. A large X discrepancy specifically points at the left/right
+    mirroring risk (the two cameras disagreeing on which side is "left");
+    a large Y discrepancy points at a scale/distance calibration issue instead
+    -- report whichever axis is actually large, don't just report the combined
+    number, since the axis tells you which problem to go fix.
+    """
+    global_a = to_global_court_point(point_a_local, "A", half_length)
+    global_b = to_global_court_point(point_b_local, "B", half_length)
+    dx = global_a[0] - global_b[0]
+    dy = global_a[1] - global_b[1]
+    distance = float(np.hypot(dx, dy))
+    return {
+        "global_a": global_a,
+        "global_b": global_b,
+        "dx": float(dx),
+        "dy": float(dy),
+        "distance_ft": distance,
+        "aligned": distance <= tolerance_ft,
+    }
+
+
 class PickleVisionTracker:
     """Single-camera draft for Project PickleVision using YOLOv8 detection + tracking."""
 
@@ -1635,6 +1685,16 @@ def parse_args():
     parser.add_argument("--court-width", type=float, default=20.0, help="Real-world width (ft) of the calibrated region (default 20, standard doubles court width)")
     parser.add_argument("--zoom", action="store_true", help="Digitally zoom: crop detection/display/recording to the calibrated court region (requires --court-corners)")
     parser.add_argument("--zoom-padding", type=float, default=0.15, help="Padding around the calibrated court corners when zoomed, as a fraction of the court's width/height (default 0.15)")
+    parser.add_argument(
+        "--check-alignment",
+        action="store_true",
+        help="Dual end-camera diagnostic: click the same real-world reference point in both --source and --source2's live feeds to verify their two half-court calibrations agree, then exit without tracking. Requires --court-corners, --source2, --court-corners2",
+    )
+    parser.add_argument("--source2", type=str, default=None, help="Second camera's video file path or USB camera index, for --check-alignment")
+    parser.add_argument("--court-corners2", type=str, default=None, help="Second camera's court calibration (same format as --court-corners), for --check-alignment")
+    parser.add_argument("--flip-horizontal2", action="store_true", help="Flip the second camera's feed horizontally, for --check-alignment")
+    parser.add_argument("--flip-vertical2", action="store_true", help="Flip the second camera's feed vertically, for --check-alignment")
+    parser.add_argument("--alignment-tolerance-ft", type=float, default=2.0, help="Max discrepancy (ft) between the two cameras' reports of the same point before --check-alignment flags them as misaligned (default 2.0)")
     return parser.parse_args()
 
 
@@ -1894,6 +1954,150 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
     return corner_str
 
 
+def check_dual_camera_alignment(
+    source_a,
+    source_b,
+    corners_a: str,
+    corners_b: str,
+    court_width: float = 20.0,
+    half_length: float = 22.0,
+    tolerance_ft: float = 2.0,
+    flip_horizontal_a: bool = False,
+    flip_vertical_a: bool = False,
+    flip_horizontal_b: bool = False,
+    flip_vertical_b: bool = False,
+    target_width: int = 1920,
+    target_height: int = 1080,
+    target_fps: int = 120,
+):
+    """Live diagnostic for the 2 end-camera setup: have a person or cone stand
+    at one spot visible to BOTH cameras, click that same real-world point in
+    each camera's own feed, and see whether their independent half-court
+    calibrations agree on where it actually is (via to_global_court_point /
+    check_camera_alignment).
+
+    Both cameras must already be calibrated for their OWN half via
+    --calibrate --court-length <half_length> (same half_length passed here).
+    Convention: local Y=0 is the net, local Y=half_length is that camera's
+    own baseline -- see to_global_court_point's docstring.
+
+    Click in the "Camera A (end)" window, then the "Camera B (end)" window,
+    to set a pair of points; the result updates live and re-clicking either
+    window replaces just that point. Press 'r' to clear both, 'q' to quit.
+    """
+    mapper_a = CourtMapper(src_points=CourtMapper.parse_corners(corners_a), court_width=court_width, court_length=half_length)
+    mapper_b = CourtMapper(src_points=CourtMapper.parse_corners(corners_b), court_width=court_width, court_length=half_length)
+
+    video_source_a = int(source_a) if isinstance(source_a, str) and source_a.isdigit() else source_a
+    video_source_b = int(source_b) if isinstance(source_b, str) and source_b.isdigit() else source_b
+    cap_a = _open_camera(video_source_a)
+    cap_b = _open_camera(video_source_b)
+    if not cap_a.isOpened():
+        raise FileNotFoundError(f"Unable to open source A: {source_a}")
+    if not cap_b.isOpened():
+        cap_a.release()
+        raise FileNotFoundError(f"Unable to open source B: {source_b}")
+
+    for cap, video_source in ((cap_a, video_source_a), (cap_b, video_source_b)):
+        if isinstance(video_source, int):
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+            cap.set(cv2.CAP_PROP_FPS, target_fps)
+
+    clicked_a: list[tuple[int, int]] = []
+    clicked_b: list[tuple[int, int]] = []
+
+    def on_click_a(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicked_a[:] = [(x, y)]
+
+    def on_click_b(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicked_b[:] = [(x, y)]
+
+    window_a = "Camera A (end)"
+    window_b = "Camera B (end)"
+    cv2.namedWindow(window_a)
+    cv2.namedWindow(window_b)
+    cv2.setMouseCallback(window_a, on_click_a)
+    cv2.setMouseCallback(window_b, on_click_b)
+
+    print(f"Checking alignment: half_length={half_length:.1f}ft, tolerance={tolerance_ft:.1f}ft")
+    print("Have a person/cone stand at one spot visible to BOTH cameras.")
+    print(f"Click that spot in '{window_a}', then the SAME spot in '{window_b}'.")
+    print("Keys: 'r' reset points | 'q' quit")
+
+    try:
+        while True:
+            ok_a, frame_a = cap_a.read()
+            ok_b, frame_b = cap_b.read()
+            if not ok_a or not ok_b:
+                print("Failed to read from one of the cameras.")
+                break
+
+            if flip_horizontal_a or flip_vertical_a:
+                flip_code = -1 if (flip_horizontal_a and flip_vertical_a) else (1 if flip_horizontal_a else 0)
+                frame_a = cv2.flip(frame_a, flip_code)
+            if flip_horizontal_b or flip_vertical_b:
+                flip_code = -1 if (flip_horizontal_b and flip_vertical_b) else (1 if flip_horizontal_b else 0)
+                frame_b = cv2.flip(frame_b, flip_code)
+
+            display_a = frame_a.copy()
+            display_b = frame_b.copy()
+
+            result = None
+            if clicked_a and clicked_b:
+                local_a = mapper_a.map_point(clicked_a[0])
+                local_b = mapper_b.map_point(clicked_b[0])
+                result = check_camera_alignment(local_a, local_b, half_length=half_length, tolerance_ft=tolerance_ft)
+
+            for display, clicked, mapper, label in (
+                (display_a, clicked_a, mapper_a, "A"),
+                (display_b, clicked_b, mapper_b, "B"),
+            ):
+                if clicked:
+                    cv2.circle(display, clicked[0], 8, (0, 0, 255), -1)
+                    local_pt = mapper.map_point(clicked[0])
+                    cv2.putText(
+                        display,
+                        f"local=({local_pt[0]:.1f}, {local_pt[1]:.1f})ft",
+                        (clicked[0][0] + 10, clicked[0][1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 0, 255),
+                        1,
+                    )
+                else:
+                    cv2.putText(display, f"Click the reference point (camera {label})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            if result is not None:
+                color = (0, 200, 0) if result["aligned"] else (0, 0, 255)
+                verdict = "ALIGNED" if result["aligned"] else "MISALIGNED"
+                lines = [
+                    f"{verdict} -- off by {result['distance_ft']:.2f} ft (tol {tolerance_ft:.1f})",
+                    f"dx={result['dx']:.2f}ft dy={result['dy']:.2f}ft",
+                    f"A global={result['global_a']}  B global={result['global_b']}",
+                ]
+                for display in (display_a, display_b):
+                    for i, line in enumerate(lines):
+                        y_pos = display.shape[0] - 15 - 20 * (len(lines) - 1 - i)
+                        cv2.putText(display, line, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            cv2.imshow(window_a, display_a)
+            cv2.imshow(window_b, display_b)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord("r"):
+                clicked_a.clear()
+                clicked_b.clear()
+    finally:
+        cap_a.release()
+        cap_b.release()
+        cv2.destroyAllWindows()
+
+
 def main():
     args = parse_args()
 
@@ -1909,6 +2113,27 @@ def main():
             court_length=args.court_length,
             flip_horizontal=args.flip_horizontal,
             flip_vertical=args.flip_vertical,
+            target_width=args.width,
+            target_height=args.height,
+            target_fps=args.fps,
+        )
+        return
+
+    if args.check_alignment:
+        if not (args.court_corners and args.source2 and args.court_corners2):
+            raise SystemExit("--check-alignment requires --court-corners, --source2, and --court-corners2 (calibrate both cameras first with --calibrate)")
+        check_dual_camera_alignment(
+            source,
+            args.source2,
+            args.court_corners,
+            args.court_corners2,
+            court_width=args.court_width,
+            half_length=args.court_length,
+            tolerance_ft=args.alignment_tolerance_ft,
+            flip_horizontal_a=args.flip_horizontal,
+            flip_vertical_a=args.flip_vertical,
+            flip_horizontal_b=args.flip_horizontal2,
+            flip_vertical_b=args.flip_vertical2,
             target_width=args.width,
             target_height=args.height,
             target_fps=args.fps,
