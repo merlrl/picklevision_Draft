@@ -1,5 +1,8 @@
 import argparse
+import contextlib
+import io
 import os
+import threading
 import time
 
 # Reference point for --stats "startup time" (launch -> first tracked frame),
@@ -20,7 +23,21 @@ os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 # default is "/tmp/cache", which on Windows lands in C:\tmp\cache -- keep it
 # next to this script instead. Once cached, the model loads with no network.
 # Must be set before importing inference, which reads it at import time.
-os.environ.setdefault("MODEL_CACHE_DIR", str(Path(__file__).resolve().parent / "model_cache"))
+_DEFAULT_MODEL_CACHE = Path(__file__).resolve().parent / "model_cache"
+if not str(_DEFAULT_MODEL_CACHE).isascii() and os.environ.get("LOCALAPPDATA"):
+    # onnxruntime's TensorRT provider can't create its engine cache folder
+    # under a non-ASCII path (e.g. OneDrive's Documents folder on a
+    # Japanese-locale Windows, which has a Japanese name): it fails with "The
+    # system cannot find the path specified" and silently falls back to
+    # plain CUDA, ~2x slower per frame.
+    _DEFAULT_MODEL_CACHE = Path(os.environ["LOCALAPPDATA"]) / "picklevision" / "model_cache"
+os.environ.setdefault("MODEL_CACHE_DIR", str(_DEFAULT_MODEL_CACHE))
+# inference points Ultralytics' settings folder at a temp path that doesn't
+# exist yet, so Ultralytics warns on every launch and falls back to creating
+# an "Ultralytics/" folder in whatever directory tracker.py is run from. Put
+# it back at Ultralytics' own Windows default (%APPDATA%\Ultralytics).
+if os.environ.get("APPDATA"):
+    os.environ.setdefault("YOLO_CONFIG_DIR", os.environ["APPDATA"])
 # Only a single detection model is used from inference -- skip its version
 # check (a network call, unwanted offline) and the unused core models that
 # otherwise print a startup warning each. Only CUDA/CPU are ever available on
@@ -70,11 +87,25 @@ import torch
 # onnxruntime-gpu (what --roboflow-local runs on for the GPU) doesn't find the
 # pip-installed NVIDIA CUDA/cuDNN DLLs on Windows by itself -- load them
 # explicitly before inference creates its session. No-op on CPU-only onnxruntime.
+#
+# With the CUDA build of torch (a CUDA 13 build: there's no CUDA 12 build of
+# torch 2.14), torch has already loaded its own, newer cuDNN by this point --
+# same DLL names as onnxruntime's pinned cuDNN 9.7, so only one set can be
+# loaded, and it has to be torch's: loading onnxruntime's first stops torch
+# from importing at all. So onnxruntime's cuDNN is skipped then (it would only
+# fail to load, noisily) and its CUDA provider runs on torch's cuDNN -- checked
+# on an RTX 4050 Laptop: correct detections on both TensorRT and plain CUDA.
+# That's also what preload_dlls' warning that torch isn't a CUDA 12 build is
+# about, so it's silenced.
 try:
     import onnxruntime
 
     if "CUDAExecutionProvider" in onnxruntime.get_available_providers():
-        onnxruntime.preload_dlls()
+        if torch.cuda.is_available():
+            with contextlib.redirect_stdout(io.StringIO()):
+                onnxruntime.preload_dlls(cudnn=False)
+        else:
+            onnxruntime.preload_dlls()
 except (ImportError, AttributeError):
     pass
 
@@ -85,6 +116,12 @@ try:
     from ultralytics import YOLO
 except ModuleNotFoundError:
     YOLO = None
+
+# Serializes calls into the --roboflow-local model, which dual-camera mode
+# shares between both cameras' trackers running on two threads. The GPU runs
+# one inference at a time regardless, so this costs nothing -- the rest of
+# each tracker's per-frame work still overlaps the other camera's.
+_LOCAL_MODEL_LOCK = threading.Lock()
 
 
 def _open_camera(index_or_path):
@@ -97,6 +134,46 @@ def _open_camera(index_or_path):
     if isinstance(index_or_path, int) and os.name == "nt":
         return cv2.VideoCapture(index_or_path, cv2.CAP_MSMF)
     return cv2.VideoCapture(index_or_path)
+
+
+def _open_video_source(source, target_width, target_height, target_fps):
+    """Open a video file or USB camera index, a camera configured the way
+    run_video configures one (MJPEG at the target size/fps). Returns
+    (cap, is_live).
+
+    Unlike run_video, never falls back to a different camera index when this
+    one fails to open: with two cameras connected, that fallback would just
+    open the other camera a second time.
+    """
+    if isinstance(source, str) and source.isdigit() and not Path(source).exists():
+        source = int(source)
+    cap = _open_camera(source)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Unable to open source: {source}")
+    is_live = isinstance(source, int)
+    if is_live:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+        cap.set(cv2.CAP_PROP_FPS, target_fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap, is_live
+
+
+def _flip_frame(frame, horizontal, vertical):
+    """Apply --flip-horizontal/--flip-vertical (or a second camera's own) to a frame."""
+    if not (horizontal or vertical):
+        return frame
+    return cv2.flip(frame, -1 if (horizontal and vertical) else (1 if horizontal else 0))
+
+
+def _draw_label(frame, text, origin, color, scale=0.6, thickness=2):
+    """cv2.putText on a black box, so it stays readable over any camera image.
+    origin is the text's bottom-left corner, as for putText."""
+    (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    x, y = origin
+    cv2.rectangle(frame, (x - 4, y - text_h - 6), (x + text_w + 4, y + baseline + 2), (0, 0, 0), -1)
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
 
 class _FrameReader:
@@ -127,7 +204,14 @@ class _FrameReader:
         import queue
 
         while not self._stopped.is_set():
-            ok, frame = self.cap.read()
+            try:
+                ok, frame = self.cap.read()
+            except cv2.error:
+                # read() can throw instead of returning False -- seen on the
+                # built-in webcam when asked for a size it doesn't support.
+                # Treated as the source failing; otherwise this thread dies
+                # and the tracking loop waits forever for its next frame.
+                ok, frame = False, None
             # Arrival time rides along with the frame, so --stats can measure
             # latency from capture to tracked, queue wait included.
             item = (frame, time.perf_counter()) if ok else (None, None)
@@ -351,11 +435,9 @@ class BallEvent:
     landing_point: tuple[float, float] | None = None
     line_call: str = "UNKNOWN"
     timestamp: float = field(default_factory=time.time)
-    # Tags which camera produced this event. A future 2nd-camera setup runs one
-    # PickleVisionTracker per camera (each with its own CourtMapper.src_points
-    # but the SAME real-world dst_points), then fuses their events by matching
-    # timestamp/frame_index across camera_id -- e.g. preferring whichever camera
-    # has a non-occluded detection for a given moment.
+    # Tags which camera produced this event: "A"/"B" in dual-camera mode
+    # (--source2), where DualCameraTracker runs one PickleVisionTracker per end
+    # camera and fuses their events into line calls on the full court.
     camera_id: str = "cam0"
 
 
@@ -434,27 +516,30 @@ class CourtMapper:
         return "OUT"
 
 
-def to_global_court_point(local_point, camera_end, half_length=22.0):
+def to_global_court_point(local_point, camera_end, half_length=22.0, court_width=20.0):
     """Convert a point from an END camera's own half-court calibration (local Y
     in [0, half_length], 0 = net) into one shared GLOBAL full-court coordinate
     system (global Y in [0, 2*half_length], 0 = end-A baseline, half_length =
     net, 2*half_length = end-B baseline).
 
-    X is passed through unchanged -- correct ONLY if both end cameras are
-    calibrated against the same physical reference (e.g. both centered on and
-    aligned with the court's centerline, per the team's actual mounting plan).
-    If that assumption doesn't hold (the two cameras' "left" don't agree),
-    check_camera_alignment below is exactly how that shows up: a large X
-    discrepancy between the two cameras' reports of the same real point.
+    Global X follows camera A's local X (0 = the sideline on camera A's left);
+    camera B's X is mirrored. The two end cameras face each other, so B's left
+    is A's right: each calibration puts local X=0 at the left of ITS OWN image
+    (--calibrate's TOP-LEFT is clicked as seen on screen), which is the
+    opposite sideline for the two cameras. Centering both cameras on the
+    centerline doesn't change that -- it only makes the mirror symmetric about
+    the centerline, so passing X through unchanged was right for points ON
+    the centerline and off by 2*(10 - x) ft everywhere else.
     """
     if camera_end not in ("A", "B"):
         raise ValueError(f"camera_end must be 'A' or 'B', got {camera_end!r}")
     local_x, local_y = local_point
-    global_y = (half_length - local_y) if camera_end == "A" else (half_length + local_y)
-    return (local_x, global_y)
+    if camera_end == "A":
+        return (local_x, half_length - local_y)
+    return (court_width - local_x, half_length + local_y)
 
 
-def check_camera_alignment(point_a_local, point_b_local, half_length=22.0, tolerance_ft=2.0):
+def check_camera_alignment(point_a_local, point_b_local, half_length=22.0, tolerance_ft=2.0, court_width=20.0):
     """Compare what the two end cameras each report, in their own local
     calibration, for what should be the SAME real-world point at the same
     moment (e.g. a person standing still while both cameras track them, or a
@@ -463,14 +548,16 @@ def check_camera_alignment(point_a_local, point_b_local, half_length=22.0, toler
 
     Returns a dict with the two points converted to global coordinates, the
     per-axis and combined discrepancy, and an "aligned" verdict against
-    `tolerance_ft`. A large X discrepancy specifically points at the left/right
-    mirroring risk (the two cameras disagreeing on which side is "left");
-    a large Y discrepancy points at a scale/distance calibration issue instead
-    -- report whichever axis is actually large, don't just report the combined
-    number, since the axis tells you which problem to go fix.
+    `tolerance_ft`. A large X discrepancy points at the two cameras
+    disagreeing on which side is "left" -- one feed flipped with
+    --flip-horizontal and the other not, or one camera's corners clicked in
+    mirrored order; a large Y discrepancy points at a scale/distance
+    calibration issue instead -- report whichever axis is actually large,
+    don't just report the combined number, since the axis tells you which
+    problem to go fix.
     """
-    global_a = to_global_court_point(point_a_local, "A", half_length)
-    global_b = to_global_court_point(point_b_local, "B", half_length)
+    global_a = to_global_court_point(point_a_local, "A", half_length, court_width)
+    global_b = to_global_court_point(point_b_local, "B", half_length, court_width)
     dx = global_a[0] - global_b[0]
     dy = global_a[1] - global_b[1]
     distance = float(np.hypot(dx, dy))
@@ -548,6 +635,7 @@ class PickleVisionTracker:
         exclude_people: bool = True,
         smoothing: float = 0.5,
         bounce_min_dy: float = 3.0,
+        shared_roboflow_model=None,
     ) -> None:
         # Two mutually exclusive detection backends: a local Ultralytics model
         # (default), or a Roboflow model/Workflow running on a self-hosted
@@ -575,14 +663,20 @@ class PickleVisionTracker:
             if roboflow_local:
                 if not roboflow_model_id:
                     raise ValueError("--roboflow-local requires --roboflow-model-id (Workflows aren't supported locally)")
-                if _TENSORRT_ENABLED and not any(
-                    Path(os.environ["MODEL_CACHE_DIR"]).glob(f"{roboflow_model_id}/**/*.engine")
-                ):
-                    print(
-                        "[TensorRT] First launch for this model: building an optimized engine for this GPU. "
-                        "This takes about 4-5 minutes once; later launches reuse it."
-                    )
-                self.roboflow_local_model = get_model(model_id=roboflow_model_id, api_key=roboflow_api_key)
+                if shared_roboflow_model is not None:
+                    # Dual-camera mode: the second camera's tracker runs the
+                    # model the first one already loaded, instead of loading
+                    # its own copy into VRAM (see _LOCAL_MODEL_LOCK).
+                    self.roboflow_local_model = shared_roboflow_model
+                else:
+                    if _TENSORRT_ENABLED and not any(
+                        Path(os.environ["MODEL_CACHE_DIR"]).glob(f"{roboflow_model_id}/**/*.engine")
+                    ):
+                        print(
+                            "[TensorRT] First launch for this model: building an optimized engine for this GPU. "
+                            "This takes about 4-5 minutes once; later launches reuse it."
+                        )
+                    self.roboflow_local_model = get_model(model_id=roboflow_model_id, api_key=roboflow_api_key)
                 self.device = "roboflow-local"
             else:
                 self.device = "roboflow-server"
@@ -634,10 +728,16 @@ class PickleVisionTracker:
         self.events: list[BallEvent] = []
         self.frame_index = 0
         self.court_mapper = court_mapper or CourtMapper()
+        # False when running on the default full-frame CourtMapper above,
+        # whose "court" is just the whole image.
+        self.court_calibrated = court_mapper is not None
         self.target_fps = target_fps
         self.target_width = target_width
         self.target_height = target_height
         self.camera_id = camera_id
+        # Prepended to this tracker's console messages -- DualCameraTracker
+        # sets it per camera, so each line says which camera it's about.
+        self.log_prefix = ""
 
         # "Digital zoom": crop detection/display to the calibrated court region so
         # the same imgsz budget is spent entirely on the area that matters, instead
@@ -774,11 +874,24 @@ class PickleVisionTracker:
         if court_point is None:
             return "UNKNOWN"
 
-        if self.zoom_roi is not None:
-            offset_x, offset_y, _, _ = self.zoom_roi
-            court_point = (court_point[0] + offset_x, court_point[1] + offset_y)
+        return self.court_mapper.classify(self.frame_coords(court_point))
 
-        return self.court_mapper.classify(court_point)
+    def frame_coords(self, point):
+        """Offset a point from the frame process_frame works on -- the cropped
+        court region when zoomed -- back to original-frame pixels, the space
+        the court calibration is in."""
+        if self.zoom_roi is None:
+            return point
+        offset_x, offset_y, _, _ = self.zoom_roi
+        return (point[0] + offset_x, point[1] + offset_y)
+
+    def ball_position(self):
+        """The locked ball's position this frame, in original-frame pixels,
+        and whether it's a real detection (False = bridged by prediction
+        through a detection gap). None when no ball is locked."""
+        if not self.primary_trajectory:
+            return None
+        return self.frame_coords(self.primary_trajectory[-1]), self.missed_frames == 0
 
     def _compute_zoom_roi(self, frame_width, frame_height):
         """Bounding box (with padding) around the calibrated court corners, in
@@ -972,7 +1085,7 @@ class PickleVisionTracker:
             distances = np.linalg.norm(centroids - last_point, axis=1)
             best_idx = int(candidate_pool[np.argmin(distances[candidate_pool])])
             if distances[best_idx] <= self.max_match_distance:
-                print(f"[Ball Lock] Re-acquired via position match: box={boxes[best_idx]}, distance={distances[best_idx]:.0f}px")
+                print(f"{self.log_prefix}[Ball Lock] Re-acquired via position match: box={boxes[best_idx]}, distance={distances[best_idx]:.0f}px")
                 return boxes[best_idx], ids[best_idx]
             if not self.missed_frames:
                 return None
@@ -993,7 +1106,7 @@ class PickleVisionTracker:
             # wrong predicted spot. Same ball, so the displayed ID is kept.
             self.primary_trajectory = []
             switching = True
-            print("[Ball Lock] Prediction had drifted off the ball; switching to confident detection")
+            print(f"{self.log_prefix}[Ball Lock] Prediction had drifted off the ball; switching to confident detection")
         else:
             switching = False
 
@@ -1009,7 +1122,7 @@ class PickleVisionTracker:
         if not switching:
             self.display_track_id = self._next_display_id
             self._next_display_id += 1
-        print(f"[Ball Lock] Acquired: box={box}, conf={confs[best_idx] if confs is not None and len(confs) else 'n/a'}, color_ratio={self._ball_color_ratio(frame, box):.2f}, display_id={self.display_track_id}")
+        print(f"{self.log_prefix}[Ball Lock] Acquired: box={box}, conf={confs[best_idx] if confs is not None and len(confs) else 'n/a'}, color_ratio={self._ball_color_ratio(frame, box):.2f}, display_id={self.display_track_id}")
         return box, ids[best_idx]
 
     def _fit_motion(self):
@@ -1275,7 +1388,8 @@ class PickleVisionTracker:
         model = self.roboflow_local_model
         session = getattr(model, "onnx_session", None)
         if session is None or getattr(model, "resize_method", None) != "Fit (black edges) in":
-            result = model.infer(image, confidence=confidence, iou_threshold=self.iou)[0]
+            with _LOCAL_MODEL_LOCK:
+                result = model.infer(image, confidence=confidence, iou_threshold=self.iou)[0]
             return [
                 {"x": p.x, "y": p.y, "width": p.width, "height": p.height, "confidence": p.confidence}
                 for p in result.predictions
@@ -1304,7 +1418,8 @@ class PickleVisionTracker:
         for plane, channel in enumerate((2, 1, 0)):  # BGR -> RGB
             np.multiply(canvas[:, :, channel], np.float32(1 / 255.0), out=blob[0, plane], casting="unsafe")
 
-        out = session.run(None, {model.input_name: blob})[0][0]
+        with _LOCAL_MODEL_LOCK:
+            out = session.run(None, {model.input_name: blob})[0][0]
         out = out[out[:, 4] > confidence]
         if not len(out):
             return []
@@ -1635,8 +1750,510 @@ class PickleVisionTracker:
         return self.events
 
 
+@dataclass
+class LineCall:
+    """One bounce on the full court, merged from the two end cameras' flags of it (see DualCameraFusion)."""
+
+    court_point: tuple[float, float]  # global court coordinates in ft (see to_global_court_point)
+    call: str  # "IN" / "OUT", against the full court
+    # CONFIRMED: both cameras put the ball at this court spot as it bounced --
+    # it really was on the ground. SINGLE: only one camera had the ball in
+    # view, so this is only as reliable as that camera's own bounce detector.
+    # (A flag the other camera saw happen in the air isn't a call at all --
+    # see DualCameraFusion.ignored_in_air.)
+    status: str
+    source_camera: str  # whose reading court_point is
+    # What found it: "A"/"B" = that camera's own _detect_ball_contact,
+    # "ground" = the two cameras' positions for the ball meeting on the ground.
+    flagged_by: tuple[str, ...]
+    frame_index: int
+    # Closest the two cameras' court positions for the ball came while it was
+    # flagged (ft), when both saw it -- a live read on how well the two
+    # calibrations agree.
+    camera_gap_ft: float | None = None
+    timestamp: float = field(default_factory=time.time)
+
+
+class DualCameraFusion:
+    """Turns the two end cameras' bounce flags into line calls on the full court.
+
+    Fusion rule (CLAUDE.md): the end camera whose own near half the ball
+    landed in is the position source -- it has the closer, more detailed
+    view. The other camera's reading is the fallback when that one didn't
+    flag the bounce, e.g. a player blocked its view.
+
+    Having two cameras also tells when the ball is on the ground. A ball on
+    the ground maps to the same court point through both cameras'
+    homographies; a ball in the air maps to two different points, each
+    pushed away from its own camera (the homography follows the line of
+    sight down to the ground) -- the higher the ball, the farther apart. So:
+
+    - Where the OTHER camera sees the ball at the moment one camera flags a
+      bounce tells a real bounce apart from a paddle hit or the top of an
+      arc, which a direction change in one camera's image can't.
+    - The gap between the two positions bottoming out near zero IS a bounce
+      (add_ground_sample). It catches bounces _detect_ball_contact misses:
+      a far-off ball traveling along the court barely moves up or down in
+      an end camera's image around its bounce -- often less than the
+      tracker's jitter threshold per frame at 120fps.
+
+    One real bounce usually arrives as several flags: _detect_ball_contact
+    keeps firing for a few frames after a direction change (and on jitter),
+    and both cameras and the ground check may flag it. Flags within
+    MERGE_WINDOW_S and MERGE_DISTANCE_FT of a bounce's first flag are merged
+    into it, and it becomes a call once that window has closed.
+    """
+
+    MERGE_WINDOW_S = 0.3
+    MERGE_DISTANCE_FT = 3.0
+    # Once both cameras have put the ball on the ground together for longer
+    # than this, it's rolling or at rest: detector jitter can still trip a
+    # camera's own bounce detector, and the other camera would "confirm" it.
+    GROUNDED_S = 0.25
+    # Whether the ball has been in the air since the last bounce is only
+    # known while both cameras see it; after this long without, it's unknown.
+    AIRBORNE_MEMORY_S = 0.5
+
+    def __init__(self, court_width=20.0, half_length=22.0, agreement_ft=3.0):
+        self.court_width = court_width
+        self.half_length = half_length
+        self.agreement_ft = agreement_ft
+        # The gap has to open up past this -- the ball clearly in the air --
+        # between two bounces, so a rolling or resting ball (gap hovering
+        # near zero with detector jitter) isn't a stream of bounces.
+        self.airborne_gap_ft = 2 * agreement_ft
+        self.calls: list[LineCall] = []
+        # Bounce flags the other camera saw happen in the air: not calls.
+        self.ignored_in_air = 0
+        # One list of flags per bounce whose merge window is still open.
+        self._pending: list[list[dict]] = []
+        # Last 3 consecutive steps where both cameras detected the ball, as
+        # (t, frame_index, gap_ft, point_a, point_b), for add_ground_sample.
+        self._gaps: list[tuple] = []
+        # Has the ball been clearly in the air since the last bounce? None =
+        # unknown. A flag the other camera confirms only starts a new bounce
+        # when this isn't False: otherwise the ball hasn't left the ground
+        # since the last one (jitter right after a bounce, or rolling).
+        self._airborne: bool | None = None
+        self._both_seen_at: float | None = None
+        self._grounded_since: float | None = None
+
+    def home_camera(self, court_point):
+        """The end camera whose own near half this court point is in."""
+        return "A" if court_point[1] < self.half_length else "B"
+
+    def classify(self, court_point):
+        """IN/OUT against the full court (lines are in) -- not either camera's own half."""
+        x, y = court_point
+        return "IN" if 0.0 <= x <= self.court_width and 0.0 <= y <= 2 * self.half_length else "OUT"
+
+    def add_ground_sample(self, t, frame_index, point_a, point_b):
+        """Both cameras' court positions for the ball this step -- each a real
+        detection, or None. Flags a bounce at the low point of the gap
+        between them, once it's within agreement_ft of zero. Call it before
+        add_flag for the same step, so the flags see the ball's latest state."""
+        if point_a is None or point_b is None:
+            # A missing step breaks the sequence a low point is read from.
+            self._gaps.clear()
+            self._grounded_since = None
+            return
+        if self._both_seen_at is None or t - self._both_seen_at > self.AIRBORNE_MEMORY_S:
+            self._airborne = None
+        self._both_seen_at = t
+        gap = float(np.hypot(point_a[0] - point_b[0], point_a[1] - point_b[1]))
+        self._gaps.append((t, frame_index, gap, point_a, point_b))
+        del self._gaps[:-3]
+        if gap > self.agreement_ft:
+            self._grounded_since = None
+        elif self._grounded_since is None:
+            self._grounded_since = t
+        if gap > self.airborne_gap_ft:
+            self._airborne = True
+        if len(self._gaps) < 3 or self._airborne is not True:
+            return
+        (_, _, before, _, _), (t_low, frame_low, low, low_a, low_b), (_, _, after, _, _) = self._gaps
+        if low < before and low <= after and low <= self.agreement_ft:
+            midpoint = ((low_a[0] + low_b[0]) / 2, (low_a[1] + low_b[1]) / 2)
+            camera = self.home_camera(midpoint)
+            self._add({
+                "camera": camera, "source": "ground", "point": low_a if camera == "A" else low_b,
+                "status": "CONFIRMED", "gap": low, "t": t_low, "frame_index": frame_low,
+            })
+            self._airborne = False
+
+    def add_flag(self, camera, court_point, other_camera_point, t, frame_index):
+        """A bounce flagged by `camera`'s own _detect_ball_contact at
+        `court_point` (global ft) at time t. other_camera_point is where the
+        other camera sees the ball at that moment -- a real detection, not a
+        prediction -- or None if it doesn't."""
+        if other_camera_point is None:
+            status, gap = "SINGLE", None
+        else:
+            gap = float(np.hypot(court_point[0] - other_camera_point[0], court_point[1] - other_camera_point[1]))
+            status = "CONFIRMED" if gap <= self.agreement_ft else "DISPUTED"
+        if status == "CONFIRMED":
+            rolling = self._grounded_since is not None and t - self._grounded_since > self.GROUNDED_S
+            if self._airborne is False or rolling:
+                return
+            # Deliberately doesn't end the airborne state itself: a flag can
+            # come a frame or two early, from jitter while the ball is already
+            # low, and the ground check's low point just after it is the
+            # precise moment of contact (it merges into the same bounce).
+        self._add({"camera": camera, "source": camera, "point": court_point, "status": status, "gap": gap, "t": t, "frame_index": frame_index})
+
+    def _add(self, flag):
+        court_point, t = flag["point"], flag["t"]
+        for bounce in self._pending:
+            first = bounce[0]
+            if t - first["t"] > self.MERGE_WINDOW_S:
+                continue
+            near = np.hypot(court_point[0] - first["point"][0], court_point[1] - first["point"][1]) <= self.MERGE_DISTANCE_FT
+            # With only one camera seeing it, a flag's court point is the
+            # ball's line of sight to the ground -- it slides along the court
+            # as the ball falls -- so that camera's flags merge on time alone.
+            same_view = flag["status"] == first["status"] == "SINGLE" and flag["camera"] == first["camera"]
+            if near or same_view:
+                bounce.append(flag)
+                return
+        self._pending.append([flag])
+
+    def close_ready(self, t, close_all=False):
+        """Turn every bounce whose merge window has closed by time t (or every
+        pending one, at the end of a session) into a call. Returns the new calls."""
+        new_calls, still_open = [], []
+        for bounce in self._pending:
+            if close_all or t - bounce[0]["t"] > self.MERGE_WINDOW_S:
+                call = self._to_call(bounce)
+                if call is None:
+                    self.ignored_in_air += 1
+                else:
+                    new_calls.append(call)
+            else:
+                still_open.append(bounce)
+        self._pending = still_open
+        self.calls.extend(new_calls)
+        return new_calls
+
+    def _to_call(self, bounce):
+        """The call for one merged bounce, or None if the other camera only
+        ever saw the ball in the air for it."""
+        statuses = {flag["status"] for flag in bounce}
+        # One flag the other camera agreed with is enough: the rest come a
+        # frame or two into the ball's rise, when the two cameras' readings
+        # have already started to separate.
+        if "CONFIRMED" in statuses:
+            status = "CONFIRMED"
+        elif "DISPUTED" in statuses:
+            return None
+        else:
+            status = "SINGLE"
+        home = self.home_camera((0.0, float(np.mean([flag["point"][1] for flag in bounce]))))
+        if status == "SINGLE":
+            # One camera's flags only: each court point is where its line of
+            # sight through the ball meets the ground, pushed away from the
+            # camera the higher the ball is -- so the flag nearest the camera
+            # was taken closest to the ground. (Measured on simulated blocked
+            # views with 2px jitter: 0.6ft median error, vs 7ft for the
+            # earliest flag, which is often jitter during the fall.)
+            best = min(bounce, key=lambda flag: flag["point"][1] if flag["camera"] == "A" else -flag["point"][1])
+        else:
+            # The home camera's reading, confirmed if possible -- from the
+            # ground check if it caught this bounce (its low point is the
+            # moment of contact; _detect_ball_contact fires a frame or more
+            # after it), otherwise the earliest flag, the next closest.
+            best = min(
+                bounce,
+                key=lambda flag: (flag["camera"] != home, flag["status"] != "CONFIRMED", flag["source"] != "ground", flag["t"]),
+            )
+        gaps = [flag["gap"] for flag in bounce if flag["gap"] is not None and flag["status"] == "CONFIRMED"]
+        return LineCall(
+            court_point=best["point"],
+            call=self.classify(best["point"]),
+            status=status,
+            source_camera=best["camera"],
+            flagged_by=tuple(sorted({flag["source"] for flag in bounce})),
+            frame_index=bounce[0]["frame_index"],
+            camera_gap_ft=min(gaps) if gaps else None,
+        )
+
+
+class DualCameraTracker:
+    """Tracks with both end cameras at once -- CLAUDE.md's dual end-camera
+    build. Each camera gets its own PickleVisionTracker (its own ball lock,
+    prediction and person filter), calibrated for its own near half
+    (--court-length 22). Their balls and bounce flags are mapped onto one
+    full-court coordinate system (to_global_court_point) and the flags are
+    fused into line calls (DualCameraFusion).
+
+    Frames are taken in lockstep, one from each camera per step. From video
+    files that pairs frame N with frame N; from live cameras it's each one's
+    newest frame -- their clocks aren't synced, so a pair can be up to one
+    frame period apart (~8ms at 120fps). Each step runs the two trackers on
+    two threads, so one camera's CPU work (filtering, drawing) overlaps the
+    other's GPU work: benchmarked on an RTX 4050 Laptop with rendered 720p
+    footage and GPU torch, 70.5 -> 81.6 pairs/s with the person filter off,
+    38.5 with it on (the default).
+    """
+
+    PANEL_HEIGHT = 360
+    COURT_VIEW_HEIGHT = 300
+    CAMERA_COLORS = {"A": (255, 170, 0), "B": (0, 150, 255)}  # BGR: blue, orange
+    RECENT_CALLS_SHOWN = 12
+
+    def __init__(self, tracker_a, tracker_b, court_width=20.0, half_length=22.0, agreement_ft=3.0):
+        self.trackers = {"A": tracker_a, "B": tracker_b}
+        for end, tracker in self.trackers.items():
+            tracker.log_prefix = f"[Cam {end}] "
+        self.court_width = court_width
+        self.half_length = half_length
+        # Court positions need both cameras calibrated -- an uncalibrated
+        # tracker's "court" is just its whole frame.
+        self.calibrated = tracker_a.court_calibrated and tracker_b.court_calibrated
+        self.fusion = DualCameraFusion(court_width, half_length, agreement_ft)
+        self.pair_index = 0
+        self._events_seen = {"A": 0, "B": 0}
+
+    def _court_point(self, end, frame_point):
+        """A point in this camera's original-frame pixels -> global court ft."""
+        local = self.trackers[end].court_mapper.map_point(frame_point)
+        return to_global_court_point(local, end, self.half_length, self.court_width)
+
+    def _update(self, t):
+        """After both cameras' step: hand any new bounce flags to the fusion.
+        Returns each camera's ball as (court point, is a real detection), or
+        None, for the court view."""
+        balls = {}
+        for end, tracker in self.trackers.items():
+            state = tracker.ball_position()
+            balls[end] = None if state is None or not self.calibrated else (self._court_point(end, state[0]), state[1])
+        # Only real detections count as a camera seeing the ball -- a
+        # prediction bridging a gap is a guess, not evidence.
+        detected = {end: ball[0] if ball is not None and ball[1] else None for end, ball in balls.items()}
+        if self.calibrated:
+            self.fusion.add_ground_sample(t, self.pair_index, detected["A"], detected["B"])
+        for end, tracker in self.trackers.items():
+            new_events = tracker.events[self._events_seen[end]:]
+            self._events_seen[end] = len(tracker.events)
+            if not self.calibrated:
+                continue
+            for event in new_events:
+                court_point = self._court_point(end, tracker.frame_coords(event.landing_point))
+                self.fusion.add_flag(end, court_point, detected["B" if end == "A" else "A"], t, self.pair_index)
+        for call in self.fusion.close_ready(t):
+            self._print_call(call)
+        return balls
+
+    @staticmethod
+    def _print_call(call):
+        x, y = call.court_point
+        where = f"({x:.1f}, {y:.1f}) ft"
+        if call.status == "CONFIRMED":
+            print(
+                f"[Call] {call.call} at {where} -- both cameras agree ({call.camera_gap_ft:.1f} ft apart), "
+                f"position from camera {call.source_camera}"
+            )
+        else:
+            print(f"[Call] {call.call} at {where} -- camera {call.source_camera} only (the other camera didn't have the ball)")
+
+    def _compose(self, annotated, balls):
+        """Both annotated feeds side by side, over a top-down court diagram."""
+        panels = []
+        for end in ("A", "B"):
+            frame = annotated[end]
+            height, width = frame.shape[:2]
+            panel = cv2.resize(frame, (max(1, round(width * self.PANEL_HEIGHT / height)), self.PANEL_HEIGHT))
+            state = self.trackers[end].ball_position()
+            label = f"Camera {end}: " + ("no ball" if state is None else ("ball" if state[1] else "ball (predicted)"))
+            _draw_label(panel, label, (10, 26), self.CAMERA_COLORS[end])
+            panels.append(panel)
+        top = np.hstack(panels)
+        return np.vstack([top, self._draw_court_view(top.shape[1], balls)])
+
+    def _draw_court_view(self, width, balls):
+        """Top-down diagram of the full court -- end A on the left, end B on
+        the right -- with each camera's ball (filled = detected, ring =
+        predicted) and the recent line calls."""
+        height = self.COURT_VIEW_HEIGHT
+        view = np.full((height, width, 3), 32, np.uint8)
+        text_area = 48
+        length = 2 * self.half_length
+        # Run-off shown past the baselines/sidelines (ft), so OUT calls stay on screen.
+        run_off_y, run_off_x = 6.0, 4.0
+        scale = min(width / (length + 2 * run_off_y), (height - text_area) / (self.court_width + 2 * run_off_x))
+        left = (width - length * scale) / 2
+        top = run_off_x * scale
+
+        def px(court_point):
+            # Court X (across) runs down the view, court Y (end A -> end B) left to right.
+            return int(round(left + court_point[1] * scale)), int(round(top + court_point[0] * scale))
+
+        def on_view(p):
+            return 0 <= p[0] < width and 0 <= p[1] < height - text_area
+
+        w, net, kitchen = self.court_width, self.half_length, 7.0
+        white = (235, 235, 235)
+        cv2.rectangle(view, px((0, 0)), px((w, length)), (100, 65, 30), -1)
+        for a, b in (
+            ((0, 0), (w, 0)), ((0, length), (w, length)),  # baselines
+            ((0, 0), (0, length)), ((w, 0), (w, length)),  # sidelines
+            ((0, net - kitchen), (w, net - kitchen)), ((0, net + kitchen), (w, net + kitchen)),  # kitchen lines
+            ((w / 2, 0), (w / 2, net - kitchen)), ((w / 2, net + kitchen), (w / 2, length)),  # centerlines
+        ):
+            cv2.line(view, px(a), px(b), white, 1)
+        cv2.line(view, px((-1, net)), px((w + 1, net)), (190, 190, 190), 3)  # net, posts just outside the sidelines
+        # Out at the edge of the run-off, clear of calls just past the baselines.
+        for end, y in (("A", 1.0 - run_off_y), ("B", length + run_off_y - 1.0)):
+            label_x, label_y = px((w / 2, y))
+            cv2.putText(view, end, (label_x - 6, label_y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.CAMERA_COLORS[end], 2)
+
+        for call in self.fusion.calls[-self.RECENT_CALLS_SHOWN:]:
+            p = px(call.court_point)
+            if on_view(p):
+                color = (0, 200, 0) if call.call == "IN" else (0, 0, 255)
+                cv2.circle(view, p, 6, color, -1 if call.status == "CONFIRMED" else 2)
+        for end, ball in balls.items():
+            if ball is not None and on_view(px(ball[0])):
+                cv2.circle(view, px(ball[0]), 4, self.CAMERA_COLORS[end], -1 if ball[1] else 1)
+
+        if not self.calibrated:
+            status = "Not calibrated: --calibrate --court-length 22 each camera, then pass --court-corners / --court-corners2"
+        elif self.fusion.calls:
+            last = self.fusion.calls[-1]
+            how = "both cameras agree" if last.status == "CONFIRMED" else f"camera {last.source_camera} only"
+            status = f"Last call: {last.call} at ({last.court_point[0]:.1f}, {last.court_point[1]:.1f}) ft -- {how}"
+            p = px(last.court_point)
+            if on_view(p):
+                cv2.putText(view, last.call, (p[0] + 8, p[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 1)
+        else:
+            status = "Waiting for the first bounce"
+        cv2.putText(view, status, (10, height - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 1)
+        cv2.putText(
+            view,
+            "calls: filled = both cameras agree, ring = one camera only | small dots = each camera's ball (ring = predicted)",
+            (10, height - 9),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (170, 170, 170),
+            1,
+        )
+        return view
+
+    def run(self, source_a, source_b, output_path=None, raw_output_a=None, raw_output_b=None, show_window=True,
+            record_fps=None, flips=None, stats_csv=None):
+        """Track both cameras until either source ends (or fails) or 'q' is
+        pressed in the window. Returns the line calls.
+
+        output_path records the combined view (both feeds + court diagram).
+        raw_output_a/raw_output_b record each camera's unannotated frames,
+        written in step, so the pair replays in sync as --source/--source2
+        video files. flips maps "A"/"B" to (horizontal, vertical).
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        if str(source_a) == str(source_b):
+            raise ValueError(f"--source and --source2 are the same ({source_a}) -- dual-camera mode needs two different cameras or videos")
+        flips = flips or {}
+        caps, live, readers, writers = {}, {}, {}, {}
+        display = stats = None
+        executor = ThreadPoolExecutor(max_workers=1)
+        t = 0.0
+        try:
+            for end, source in (("A", source_a), ("B", source_b)):
+                tracker = self.trackers[end]
+                caps[end], live[end] = _open_video_source(source, tracker.target_width, tracker.target_height, tracker.target_fps)
+                cap = caps[end]
+                print(
+                    f"[Camera {end}] {source}: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+                    f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {int(cap.get(cv2.CAP_PROP_FPS)) or 30}fps"
+                )
+            fps = min(int(cap.get(cv2.CAP_PROP_FPS)) or 30 for cap in caps.values())
+
+            # Same recording rules as run_video: a lower write rate than the
+            # capture rate (see its comment on the encode feedback loop), and
+            # frame-paced to wall-clock time so recordings play at real speed.
+            default_record_fps = 10 if self.trackers["A"].use_roboflow else 30
+            record_fps = record_fps if record_fps else min(fps, default_record_fps)
+            outputs = {key: Path(path) for key, path in (("view", output_path), ("A", raw_output_a), ("B", raw_output_b)) if path}
+            for path in outputs.values():
+                path.parent.mkdir(parents=True, exist_ok=True)
+            if outputs and record_fps < fps:
+                print(f"[Recording] Capturing/detecting at {fps}fps, writing video at {record_fps}fps")
+            record_start = time.time()
+            frames_written = 0
+            max_catchup_frames_per_iteration = max(1, int(record_fps))
+
+            stats = _SessionStats(stats_csv) if stats_csv else None
+            for end, cap in caps.items():
+                readers[end] = _FrameReader(cap, live=live[end])
+            # Merge windows need a clock that matches the footage: video files
+            # can be processed faster or slower than they were recorded.
+            frame_clock = not any(live.values())
+
+            while True:
+                frames, arrivals = {}, {}
+                for end, reader in readers.items():
+                    frames[end], arrivals[end] = reader.read()
+                ended = [end for end, frame in frames.items() if frame is None]
+                if ended:
+                    print(f"[Dual] Camera {' and '.join(ended)} stopped delivering frames -- ending the session")
+                    break
+                self.pair_index += 1
+                for end in frames:
+                    frames[end] = _flip_frame(frames[end], *flips.get(end, (False, False)))
+                # Copied before process_frame draws on the frames (see run_video).
+                raw = {end: frames[end].copy() for end in ("A", "B") if end in outputs}
+
+                future = executor.submit(self.trackers["A"].process_frame, frames["A"])
+                annotated = {"B": self.trackers["B"].process_frame(frames["B"])}
+                annotated["A"] = future.result()
+
+                t = self.pair_index / fps if frame_clock else min(arrivals.values())
+                balls = self._update(t)
+                view = self._compose(annotated, balls)
+                if stats is not None:
+                    # One pair = one "frame" here: fps is pairs per second, and
+                    # latency is from the older of the two frames' arrivals.
+                    stats.frame_done(min(arrivals.values()))
+
+                if outputs:
+                    to_write = {"view": view, **raw}
+                    if not writers:
+                        for key, path in outputs.items():
+                            size = (to_write[key].shape[1], to_write[key].shape[0])
+                            writers[key] = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), record_fps, size)
+                    expected_frames = int((time.time() - record_start) * record_fps)
+                    catchup_target = min(expected_frames, frames_written + max_catchup_frames_per_iteration)
+                    while frames_written <= catchup_target:
+                        for key, writer in writers.items():
+                            writer.write(to_write[key])
+                        frames_written += 1
+
+                if show_window:
+                    if display is None:
+                        display = _FrameDisplay("Project PickleVision - Dual Camera", view.shape[1], view.shape[0])
+                    display.show(view)
+                    if display.quit_requested.is_set():
+                        break
+        finally:
+            executor.shutdown(wait=True)
+            for reader in readers.values():
+                reader.stop()
+            for cap in caps.values():
+                cap.release()
+            for writer in writers.values():
+                writer.release()
+            if display is not None:
+                display.stop()
+            if stats is not None:
+                stats.close()
+            for call in self.fusion.close_ready(t, close_all=True):
+                self._print_call(call)
+
+        return self.fusion.calls
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Project PickleVision: single-camera YOLOv8 tracking prototype for ELP 120fps USB camera")
+    parser = argparse.ArgumentParser(description="Project PickleVision: YOLOv8 tracking prototype for ELP 120fps USB cameras -- one camera, or two end cameras with --source2")
     parser.add_argument("--source", type=str, default="0", help="Video file path or USB camera index (default: 0)")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLOv8 model to load")
     parser.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tracking configuration")
@@ -1652,16 +2269,16 @@ def parse_args():
     parser.add_argument("--roboflow-workflow-id", type=str, default=None, help="Roboflow workflow ID -- only used if --roboflow-model-id is empty. Note a Workflow's model reference is pinned separately from the project's 'Current Model' setting and can silently lag behind after retraining")
     parser.add_argument("--roboflow-infer-size", type=int, default=640, help="Downscale the frame to this max dimension before sending to the Roboflow server (default 640). Benchmarked: 1920x1080 caps around 7 FPS over the network round-trip vs ~17 FPS at 640x480 -- lower this further for more speed at the cost of long-distance detection detail")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold for NMS")
-    parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path (boxes/labels/trajectory baked in -- for review, not training)")
-    parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training")
+    parser.add_argument("--output", type=str, default=None, help="Optional annotated output video path (boxes/labels/trajectory baked in -- for review, not training). With --source2: the combined view, both feeds plus the court diagram")
+    parser.add_argument("--raw-output", type=str, default=None, help="Optional unannotated output video path, safe to upload to Roboflow for annotation/training. With --source2 this is --source's footage (see --raw-output2)")
     parser.add_argument("--record-fps", type=int, default=None, help="FPS to WRITE recorded video at (default: min(camera fps, 30)). Capture/detection still runs at full --fps; only the saved file rate is lowered, since encoding two full-res streams at 120fps is heavy CPU work")
     parser.add_argument("--show", action="store_true", default=True, help="Display annotated frames in real-time")
     parser.add_argument("--fps", type=int, default=120, help="Target camera FPS (default: 120, for the ELP camera; a camera that can't do it falls back to its own max)")
-    parser.add_argument("--width", type=int, default=640, help="Target camera width in pixels (default: 640; use 1920 for ELP camera)")
-    parser.add_argument("--height", type=int, default=480, help="Target camera height in pixels (default: 480; use 1080 for ELP camera)")
+    parser.add_argument("--width", type=int, default=1280, help="Target camera width in pixels (default: 1280 -- 720p, the target for multi-camera headroom; 1920 for 1080p). Calibrate at the same size you track at")
+    parser.add_argument("--height", type=int, default=720, help="Target camera height in pixels (default: 720; 1080 for 1080p)")
     parser.add_argument("--court-corners", type=str, default=None, help="Court calibration: x1 y1 x2 y2 x3 y3 x4 y4 (TL TR BR BL)")
     parser.add_argument("--max-missed-frames", type=int, default=15, help="Frames to keep extrapolating the ball's position through a detection gap (e.g. motion blur) before dropping the track")
-    parser.add_argument("--stats", action="store_true", help="Log performance and resources: startup time, fps, frame latency, CPU/RAM, GPU utilization/temperature/power. Prints every 5s plus a summary at the end, and saves a per-second CSV (see --stats-csv)")
+    parser.add_argument("--stats", action="store_true", help="Log performance and resources: startup time, fps, frame latency, CPU/RAM, GPU utilization/temperature/power. Prints every 5s plus a summary at the end, and saves a per-second CSV (see --stats-csv). With --source2, fps counts camera pairs per second")
     parser.add_argument("--stats-csv", type=str, default=None, help="CSV path for --stats (default: logs/session_<date>_<time>_cam<source>.csv)")
     parser.add_argument("--smoothing", type=float, default=0.5, help="Trajectory smoothing, 0-1 (default 0.5). 0 = raw detector positions (jittery); higher = smoother path but lags a fast ball more")
     parser.add_argument("--bounce-min-dy", type=float, default=3.0, help="Per-frame vertical movement (px) below which a Y change is treated as detector jitter rather than a bounce (default 3)")
@@ -1681,19 +2298,21 @@ def parse_args():
     parser.add_argument("--calibration-output", type=str, default=None, help="Optional file path to save the calibrated --court-corners string to")
     parser.add_argument("--flip-horizontal", action="store_true", help="Flip the camera feed horizontally (fixes a mirrored image, e.g. left/right reversed) before detection, display, and recording")
     parser.add_argument("--flip-vertical", action="store_true", help="Flip the camera feed vertically (e.g. if the camera is mounted upside down) before detection, display, and recording")
-    parser.add_argument("--court-length", type=float, default=44.0, help="Real-world length (ft) of the calibrated region: 44 for a full court, 22 to scope to just one half (baseline to net)")
+    parser.add_argument("--court-length", type=float, default=None, help="Real-world length (ft) of the calibrated region: 44 for a full court, 22 to scope to just one half (baseline to net). Default 44, or 22 with --source2 -- the two end cameras are each calibrated for their own half")
     parser.add_argument("--court-width", type=float, default=20.0, help="Real-world width (ft) of the calibrated region (default 20, standard doubles court width)")
     parser.add_argument("--zoom", action="store_true", help="Digitally zoom: crop detection/display/recording to the calibrated court region (requires --court-corners)")
     parser.add_argument("--zoom-padding", type=float, default=0.15, help="Padding around the calibrated court corners when zoomed, as a fraction of the court's width/height (default 0.15)")
     parser.add_argument(
         "--check-alignment",
         action="store_true",
-        help="Dual end-camera diagnostic: click the same real-world reference point in both --source and --source2's live feeds to verify their two half-court calibrations agree, then exit without tracking. Requires --court-corners, --source2, --court-corners2",
+        help="Dual end-camera setup tool (needs --source2), then exit without tracking. Live view of both cameras with center/level guides for aiming each one straight down the court's centerline. With --court-corners/--court-corners2 it also draws each calibrated court (the far half too, extrapolated past the net) with an aiming readout, and you click the same real-world point in both feeds to verify the two half-court calibrations agree",
     )
-    parser.add_argument("--source2", type=str, default=None, help="Second camera's video file path or USB camera index, for --check-alignment")
-    parser.add_argument("--court-corners2", type=str, default=None, help="Second camera's court calibration (same format as --court-corners), for --check-alignment")
-    parser.add_argument("--flip-horizontal2", action="store_true", help="Flip the second camera's feed horizontally, for --check-alignment")
-    parser.add_argument("--flip-vertical2", action="store_true", help="Flip the second camera's feed vertically, for --check-alignment")
+    parser.add_argument("--source2", type=str, default=None, help="Second end camera: video file path or USB camera index. Tracks both cameras at once and fuses them onto one full court -- calibrate each for its own half (--calibrate --court-length 22) and pass --court-corners for --source, --court-corners2 for this one. Also used by --check-alignment")
+    parser.add_argument("--court-corners2", type=str, default=None, help="Second camera's half-court calibration (same format as --court-corners), for dual-camera tracking and --check-alignment")
+    parser.add_argument("--flip-horizontal2", action="store_true", help="Flip the second camera's feed horizontally, for dual-camera tracking and --check-alignment")
+    parser.add_argument("--flip-vertical2", action="store_true", help="Flip the second camera's feed vertically, for dual-camera tracking and --check-alignment")
+    parser.add_argument("--raw-output2", type=str, default=None, help="With --source2: unannotated footage from --source2 (--raw-output saves --source's). Both are written frame-for-frame in step, so the pair replays in sync as --source/--source2 video files")
+    parser.add_argument("--bounce-agreement-ft", type=float, default=3.0, help="With --source2: how close (ft) the two cameras' court positions for the ball must be when one flags a bounce for it to count as confirmed by both (default 3). A ball on the ground maps to the same court spot from both ends; one in the air doesn't, so a bounce the other camera disagrees with is ignored as a hit or the top of an arc")
     parser.add_argument("--alignment-tolerance-ft", type=float, default=2.0, help="Max discrepancy (ft) between the two cameras' reports of the same point before --check-alignment flags them as misaligned (default 2.0)")
     return parser.parse_args()
 
@@ -1779,10 +2398,15 @@ def run_elp_self_hosted_inference(
     return None
 
 
-def _court_reference_lines(mapper: CourtMapper):
+def _court_reference_lines(mapper: CourtMapper, include_far_half: bool = False):
     """Standard court reference lines (baselines, sidelines, net, kitchen, centerline),
     projected from real-world court coordinates back into image space via the
     inverse homography -- used to visually sanity-check a calibration.
+
+    Follows --calibrate's click order: the TOP edge (y_min) is the far
+    baseline for a full court, or the net for a half court; the BOTTOM edge
+    (y_max) is the near baseline either way. include_far_half adds, for a
+    half-court calibration, the other half extrapolated past the net.
     """
     x_min = float(np.min(mapper.dst_points[:, 0]))
     x_max = float(np.max(mapper.dst_points[:, 0]))
@@ -1792,8 +2416,8 @@ def _court_reference_lines(mapper: CourtMapper):
     center_x = x_min + width / 2.0
 
     segments = [
-        ((x_min, y_min), (x_max, y_min)),  # near edge
-        ((x_min, y_max), (x_max, y_max)),  # far edge
+        ((x_min, y_min), (x_max, y_min)),  # far edge: far baseline, or the net for a half court
+        ((x_min, y_max), (x_max, y_max)),  # near baseline
         ((x_min, y_min), (x_min, y_max)),  # sideline
         ((x_max, y_min), (x_max, y_max)),  # sideline
     ]
@@ -1811,14 +2435,28 @@ def _court_reference_lines(mapper: CourtMapper):
             ((center_x, kitchen_far_y), (center_x, y_max)),
         ]
     else:
-        # Half-court calibration (baseline -> net): the far edge IS the net.
-        net_y = y_max
-        kitchen_y = net_y - 7.0
+        # Half-court calibration (net -> near baseline): the far edge IS the
+        # net, and this half's kitchen line is 7ft in front of it.
+        net_y = y_min
+        kitchen_y = net_y + 7.0
         segments += [
             ((x_min, net_y), (x_max, net_y)),
             ((x_min, kitchen_y), (x_max, kitchen_y)),
-            ((center_x, y_min), (center_x, kitchen_y)),
+            ((center_x, kitchen_y), (center_x, y_max)),
         ]
+        if include_far_half:
+            # Where this calibration puts the other half's lines -- they
+            # should land on the real ones too, since the other end's
+            # camera takes over there.
+            far_baseline_y = net_y - (y_max - y_min)
+            far_kitchen_y = net_y - 7.0
+            segments += [
+                ((x_min, far_baseline_y), (x_max, far_baseline_y)),
+                ((x_min, far_kitchen_y), (x_max, far_kitchen_y)),
+                ((x_min, far_baseline_y), (x_min, net_y)),
+                ((x_max, far_baseline_y), (x_max, net_y)),
+                ((center_x, far_kitchen_y), (center_x, far_baseline_y)),
+            ]
 
     endpoints = np.array(segments, dtype=np.float32).reshape(-1, 1, 2)
     inv_h = np.linalg.inv(mapper.h_matrix)
@@ -1954,11 +2592,84 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
     return corner_str
 
 
+def _aim_readout(mapper: CourtMapper, frame_width: int):
+    """How far a half-court-calibrated end camera is from looking straight
+    down the court's centerline, from its calibration. Measured against the
+    image's vertical center line, so it assumes the lens is centered on the
+    sensor (true of practically every camera):
+
+    - net_offset_px / baseline_offset_px: where the calibrated centerline
+      crosses the net and the near baseline (+ = right of center) -- the
+      cyan centerline against the magenta guide.
+    - far_offset_px: where the court's long lines converge (their vanishing
+      point). Only aiming (pan) moves it, not where the camera stands.
+    - lateral_ft: how far the camera stands right (+) or left of the
+      centerline -- standing off to one side is what slants the centerline.
+    - tilt_deg: the net line's tilt (+ = its right end lower).
+
+    A level camera centered on the centerline and aimed straight along it
+    reads 0 on all of them.
+    """
+    x_min, x_max = float(np.min(mapper.dst_points[:, 0])), float(np.max(mapper.dst_points[:, 0]))
+    y_min, y_max = float(np.min(mapper.dst_points[:, 1])), float(np.max(mapper.dst_points[:, 1]))
+    center_x = (x_min + x_max) / 2.0
+    inv_h = np.linalg.inv(mapper.h_matrix)
+    court = np.array(
+        [[center_x, y_min], [center_x, y_max], [x_min, y_min], [x_max, y_min], [x_min, y_max], [x_max, y_max]],
+        dtype=np.float32,
+    )
+    net_center, baseline_center, net_left, net_right, baseline_left, baseline_right = cv2.perspectiveTransform(
+        court.reshape(-1, 1, 2), inv_h
+    ).reshape(-1, 2)
+    vanishing = inv_h @ np.array([0.0, 1.0, 0.0])  # the court's long direction, at infinity
+    far_u = vanishing[0] / vanishing[2] if abs(vanishing[2]) > 1e-9 else net_center[0]
+    # The baseline is square to a straight-aimed camera, so its known width
+    # gives the image scale there for turning the slant into feet.
+    px_per_ft = np.hypot(*(baseline_right - baseline_left)) / (x_max - x_min)
+    return {
+        "net_offset_px": float(net_center[0] - frame_width / 2.0),
+        "baseline_offset_px": float(baseline_center[0] - frame_width / 2.0),
+        "far_offset_px": float(far_u - frame_width / 2.0),
+        # The centerline's near end swings toward the side the line is on,
+        # i.e. away from the side the camera stands on.
+        "lateral_ft": float(-(baseline_center[0] - far_u) / px_per_ft),
+        "tilt_deg": float(np.degrees(np.arctan2(net_right[1] - net_left[1], net_right[0] - net_left[0]))),
+    }
+
+
+def _aim_advice(readout, frame_width, pan_tolerance_frac=0.02, tilt_tolerance_deg=1.0, lateral_tolerance_ft=0.5):
+    """The next physical adjustment to make, from _aim_readout (directions as
+    seen from behind the camera), or None once it's aimed straight. One at a
+    time, in this order: a pan also tilts the net and slants the centerline,
+    and a roll slants the centerline too, so each reading is only
+    trustworthy once the ones before it are fixed."""
+    if abs(readout["far_offset_px"]) > frame_width * pan_tolerance_frac:
+        return f"pan {'right' if readout['far_offset_px'] > 0 else 'left'}"
+    if abs(readout["tilt_deg"]) > tilt_tolerance_deg:
+        return f"rotate {'clockwise' if readout['tilt_deg'] > 0 else 'counter-clockwise'} ~{abs(readout['tilt_deg']):.1f} deg"
+    if abs(readout["lateral_ft"]) > lateral_tolerance_ft:
+        return f"move {'left' if readout['lateral_ft'] > 0 else 'right'} ~{abs(readout['lateral_ft']):.1f} ft"
+    return None
+
+
+def _draw_aim_guides(frame):
+    """Aiming guides on an end camera's live feed: it's looking straight down
+    the court once the court's centerline runs along the vertical center
+    guide and the net and baselines lie level with the horizontal ones."""
+    height, width = frame.shape[:2]
+    color = (255, 0, 255)
+    cv2.line(frame, (width // 2, 0), (width // 2, height), color, 1)
+    for frac in (0.25, 0.5, 0.75):
+        y = int(height * frac)
+        for x in range(0, width, 24):  # dashed, to stay out of the court lines' way
+            cv2.line(frame, (x, y), (min(x + 12, width), y), color, 1)
+
+
 def check_dual_camera_alignment(
     source_a,
     source_b,
-    corners_a: str,
-    corners_b: str,
+    corners_a: str | None = None,
+    corners_b: str | None = None,
     court_width: float = 20.0,
     half_length: float = 22.0,
     tolerance_ft: float = 2.0,
@@ -1970,136 +2681,260 @@ def check_dual_camera_alignment(
     target_height: int = 1080,
     target_fps: int = 120,
 ):
-    """Live diagnostic for the 2 end-camera setup: have a person or cone stand
-    at one spot visible to BOTH cameras, click that same real-world point in
-    each camera's own feed, and see whether their independent half-court
-    calibrations agree on where it actually is (via to_global_court_point /
-    check_camera_alignment).
+    """Live setup tool for the 2 end cameras (one behind each baseline, facing
+    each other, centered on the centerline), in two stages:
 
-    Both cameras must already be calibrated for their OWN half via
-    --calibrate --court-length <half_length> (same half_length passed here).
-    Convention: local Y=0 is the net, local Y=half_length is that camera's
-    own baseline -- see to_global_court_point's docstring.
+    1. Aim -- no calibration needed. Each feed shows a vertical center guide
+       and dashed level guides: turn each camera until the court's centerline
+       runs up the center guide and the net sits level.
+    2. Verify -- needs both cameras calibrated for their own half (--calibrate
+       --court-length <half_length>). Each calibrated court is drawn over its
+       feed in cyan, including the far half extrapolated past the net, which
+       should land on the real lines too, with a readout of how far the
+       calibrated centerline is from the center guide and what to adjust
+       (then recalibrate: a calibration describes where the camera was when
+       its corners were clicked). Then have a person or cone stand at a spot
+       visible to BOTH cameras and click it in each window: the two
+       calibrations should put it at the same court position
+       (to_global_court_point / check_camera_alignment). Check a few spots,
+       including near a sideline -- a spot on the centerline can't reveal a
+       left/right mix-up.
 
-    Click in the "Camera A (end)" window, then the "Camera B (end)" window,
-    to set a pair of points; the result updates live and re-clicking either
-    window replaces just that point. Press 'r' to clear both, 'q' to quit.
+    Clicking either window replaces just that window's point. Press 'r' to
+    clear both, 'q' to quit.
     """
-    mapper_a = CourtMapper(src_points=CourtMapper.parse_corners(corners_a), court_width=court_width, court_length=half_length)
-    mapper_b = CourtMapper(src_points=CourtMapper.parse_corners(corners_b), court_width=court_width, court_length=half_length)
+    mappers = {
+        end: CourtMapper(src_points=CourtMapper.parse_corners(corners), court_width=court_width, court_length=half_length)
+        if corners
+        else None
+        for end, corners in (("A", corners_a), ("B", corners_b))
+    }
+    flips = {"A": (flip_horizontal_a, flip_vertical_a), "B": (flip_horizontal_b, flip_vertical_b)}
+    windows = {"A": "Camera A (end)", "B": "Camera B (end)"}
+    clicked: dict[str, list[tuple[int, int]]] = {"A": [], "B": []}
 
-    video_source_a = int(source_a) if isinstance(source_a, str) and source_a.isdigit() else source_a
-    video_source_b = int(source_b) if isinstance(source_b, str) and source_b.isdigit() else source_b
-    cap_a = _open_camera(video_source_a)
-    cap_b = _open_camera(video_source_b)
-    if not cap_a.isOpened():
-        raise FileNotFoundError(f"Unable to open source A: {source_a}")
-    if not cap_b.isOpened():
-        cap_a.release()
-        raise FileNotFoundError(f"Unable to open source B: {source_b}")
+    caps = {}
+    try:
+        for end, source in (("A", source_a), ("B", source_b)):
+            caps[end], _ = _open_video_source(source, target_width, target_height, target_fps)
+    except FileNotFoundError:
+        for cap in caps.values():
+            cap.release()
+        raise
 
-    for cap, video_source in ((cap_a, video_source_a), (cap_b, video_source_b)):
-        if isinstance(video_source, int):
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
-            cap.set(cv2.CAP_PROP_FPS, target_fps)
+    def on_click(end):
+        def handler(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                clicked[end][:] = [(x, y)]
 
-    clicked_a: list[tuple[int, int]] = []
-    clicked_b: list[tuple[int, int]] = []
+        return handler
 
-    def on_click_a(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            clicked_a[:] = [(x, y)]
+    for end, window in windows.items():
+        cv2.namedWindow(window)
+        cv2.setMouseCallback(window, on_click(end))
 
-    def on_click_b(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            clicked_b[:] = [(x, y)]
-
-    window_a = "Camera A (end)"
-    window_b = "Camera B (end)"
-    cv2.namedWindow(window_a)
-    cv2.namedWindow(window_b)
-    cv2.setMouseCallback(window_a, on_click_a)
-    cv2.setMouseCallback(window_b, on_click_b)
-
-    print(f"Checking alignment: half_length={half_length:.1f}ft, tolerance={tolerance_ft:.1f}ft")
-    print("Have a person/cone stand at one spot visible to BOTH cameras.")
-    print(f"Click that spot in '{window_a}', then the SAME spot in '{window_b}'.")
+    print(f"Camera alignment: half_length={half_length:.1f}ft, tolerance={tolerance_ft:.1f}ft")
+    print("1) Aim: turn each camera until the court's centerline runs up the magenta center line and the net sits level.")
+    if all(mapper is not None for mapper in mappers.values()):
+        print("2) Verify: have a person/cone stand at one spot visible to BOTH cameras.")
+        print(f"   Click it in '{windows['A']}', then the SAME spot in '{windows['B']}'. Try a spot near a sideline too.")
+    else:
+        missing = " and ".join(end for end, mapper in mappers.items() if mapper is None)
+        print(f"   Camera {missing} not calibrated -- calibrate with --calibrate --court-length {half_length:g} for the calibration checks.")
     print("Keys: 'r' reset points | 'q' quit")
 
     try:
         while True:
-            ok_a, frame_a = cap_a.read()
-            ok_b, frame_b = cap_b.read()
-            if not ok_a or not ok_b:
+            frames = {}
+            for end, cap in caps.items():
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames[end] = _flip_frame(frame, *flips[end])
+            if len(frames) < 2:
                 print("Failed to read from one of the cameras.")
                 break
 
-            if flip_horizontal_a or flip_vertical_a:
-                flip_code = -1 if (flip_horizontal_a and flip_vertical_a) else (1 if flip_horizontal_a else 0)
-                frame_a = cv2.flip(frame_a, flip_code)
-            if flip_horizontal_b or flip_vertical_b:
-                flip_code = -1 if (flip_horizontal_b and flip_vertical_b) else (1 if flip_horizontal_b else 0)
-                frame_b = cv2.flip(frame_b, flip_code)
-
-            display_a = frame_a.copy()
-            display_b = frame_b.copy()
-
             result = None
-            if clicked_a and clicked_b:
-                local_a = mapper_a.map_point(clicked_a[0])
-                local_b = mapper_b.map_point(clicked_b[0])
-                result = check_camera_alignment(local_a, local_b, half_length=half_length, tolerance_ft=tolerance_ft)
+            if all(clicked[end] and mappers[end] is not None for end in ("A", "B")):
+                result = check_camera_alignment(
+                    mappers["A"].map_point(clicked["A"][0]),
+                    mappers["B"].map_point(clicked["B"][0]),
+                    half_length=half_length,
+                    tolerance_ft=tolerance_ft,
+                    court_width=court_width,
+                )
 
-            for display, clicked, mapper, label in (
-                (display_a, clicked_a, mapper_a, "A"),
-                (display_b, clicked_b, mapper_b, "B"),
-            ):
-                if clicked:
-                    cv2.circle(display, clicked[0], 8, (0, 0, 255), -1)
-                    local_pt = mapper.map_point(clicked[0])
-                    cv2.putText(
-                        display,
-                        f"local=({local_pt[0]:.1f}, {local_pt[1]:.1f})ft",
-                        (clicked[0][0] + 10, clicked[0][1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 0, 255),
-                        1,
-                    )
+            for end, display in frames.items():
+                _draw_aim_guides(display)
+                mapper = mappers[end]
+                if mapper is not None:
+                    for (lx1, ly1), (lx2, ly2) in _court_reference_lines(mapper, include_far_half=True):
+                        cv2.line(display, (int(lx1), int(ly1)), (int(lx2), int(ly2)), (255, 255, 0), 1)
+                    aim = _aim_readout(mapper, display.shape[1])
+                    advice = _aim_advice(aim, display.shape[1])
+                    side = "right" if aim["lateral_ft"] > 0 else "left"
+                    readout = [
+                        f"Centerline {aim['net_offset_px']:+.0f}px at net, {aim['baseline_offset_px']:+.0f}px at baseline"
+                        f" | net tilt {aim['tilt_deg']:+.1f} deg | camera {abs(aim['lateral_ft']):.1f} ft {side} of centerline",
+                        "AIMED STRAIGHT" if advice is None else f"Next: {advice}, then recalibrate and check again",
+                    ]
+                    readout_color = (0, 200, 0) if advice is None else (0, 215, 255)
                 else:
-                    cv2.putText(display, f"Click the reference point (camera {label})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    readout = ["Aim: centerline on the magenta line, net level", f"Not calibrated (--calibrate --court-length {half_length:g})"]
+                    readout_color = (0, 215, 255)
+                for i, line in enumerate(readout):
+                    _draw_label(display, line, (10, 28 + 26 * i), readout_color)
 
-            if result is not None:
-                color = (0, 200, 0) if result["aligned"] else (0, 0, 255)
-                verdict = "ALIGNED" if result["aligned"] else "MISALIGNED"
-                lines = [
-                    f"{verdict} -- off by {result['distance_ft']:.2f} ft (tol {tolerance_ft:.1f})",
-                    f"dx={result['dx']:.2f}ft dy={result['dy']:.2f}ft",
-                    f"A global={result['global_a']}  B global={result['global_b']}",
-                ]
-                for display in (display_a, display_b):
+                if clicked[end]:
+                    point = clicked[end][0]
+                    cv2.circle(display, point, 8, (0, 0, 255), -1)
+                    if mapper is not None:
+                        court_x, court_y = to_global_court_point(mapper.map_point(point), end, half_length, court_width)
+                        _draw_label(display, f"court=({court_x:.1f}, {court_y:.1f})ft", (point[0] + 12, point[1] - 12), (0, 0, 255), 0.5, 1)
+                elif all(mapper is not None for mapper in mappers.values()):
+                    _draw_label(display, f"Click the reference point (camera {end})", (10, 28 + 26 * len(readout)), (0, 255, 255))
+
+                if result is not None:
+                    color = (0, 200, 0) if result["aligned"] else (0, 0, 255)
+                    lines = [
+                        f"{'ALIGNED' if result['aligned'] else 'MISALIGNED'} -- off by {result['distance_ft']:.2f} ft (tol {tolerance_ft:.1f})",
+                        f"dx={result['dx']:+.2f}ft (across) dy={result['dy']:+.2f}ft (along the court)",
+                    ]
+                    if not result["aligned"]:
+                        # A left/right mirror mix-up is off by 2*(10 - x) ft -- big,
+                        # and growing toward the sidelines; a stale or sloppy
+                        # calibration is off by a few feet anywhere.
+                        lines.append(
+                            "Mostly across: recalibrate (camera moved?); one feed flipped if it grows near the sidelines"
+                            if abs(result["dx"]) > abs(result["dy"])
+                            else "Mostly along the court: recalibrate (camera moved?); both need --court-length 22"
+                        )
                     for i, line in enumerate(lines):
-                        y_pos = display.shape[0] - 15 - 20 * (len(lines) - 1 - i)
-                        cv2.putText(display, line, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        _draw_label(display, line, (10, display.shape[0] - 12 - 26 * (len(lines) - 1 - i)), color)
 
-            cv2.imshow(window_a, display_a)
-            cv2.imshow(window_b, display_b)
+                cv2.imshow(windows[end], display)
+
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("r"):
-                clicked_a.clear()
-                clicked_b.clear()
+                clicked["A"].clear()
+                clicked["B"].clear()
     finally:
-        cap_a.release()
-        cap_b.release()
+        for cap in caps.values():
+            cap.release()
         cv2.destroyAllWindows()
+
+
+def _build_tracker(args, court_corners, camera_id="cam0", shared_roboflow_model=None):
+    """A PickleVisionTracker configured from the command line, calibrated with
+    court_corners (a --court-corners string), or uncalibrated if it's None."""
+    court_points = CourtMapper.parse_corners(court_corners) if court_corners else None
+    court_mapper = (
+        CourtMapper(src_points=court_points, court_width=args.court_width, court_length=args.court_length)
+        if court_points is not None
+        else None
+    )
+
+    return PickleVisionTracker(
+        model_name=args.model,
+        tracker_config=args.tracker,
+        conf=args.conf,
+        reacquire_conf=args.reacquire_conf,
+        iou=args.iou,
+        court_mapper=court_mapper,
+        target_fps=args.fps,
+        target_width=args.width,
+        target_height=args.height,
+        max_missed_frames=args.max_missed_frames,
+        max_match_distance=args.match_distance,
+        require_ball_color=not args.no_color_filter,
+        exclude_people=not args.no_exclude_people,
+        ball_color_min_ratio=args.ball_color_min_ratio,
+        min_box_dimension=args.min_box_dimension,
+        min_aspect_ratio=args.min_aspect_ratio,
+        device=args.device,
+        imgsz=args.imgsz,
+        camera_id=camera_id,
+        zoom_to_court=args.zoom,
+        zoom_padding=args.zoom_padding,
+        target_class_id=None if args.target_class_id == -1 else args.target_class_id,
+        use_roboflow=args.use_roboflow,
+        roboflow_api_url=args.roboflow_api_url,
+        roboflow_api_key=args.roboflow_api_key,
+        roboflow_workspace_name=args.roboflow_workspace,
+        roboflow_model_id=args.roboflow_model_id,
+        roboflow_workflow_id=args.roboflow_workflow_id,
+        roboflow_infer_size=args.roboflow_infer_size,
+        roboflow_local=args.roboflow_local,
+        smoothing=args.smoothing,
+        bounce_min_dy=args.bounce_min_dy,
+        shared_roboflow_model=shared_roboflow_model,
+    )
+
+
+def _warm_up(tracker, args):
+    print(f"[Device] Running inference on: {tracker.device}")
+    if tracker.roboflow_local_model is not None:
+        # Warm up here so the one-time TensorRT engine build (or CUDA init)
+        # happens before the camera opens, not as a multi-minute freeze on
+        # the first live frame.
+        tracker.roboflow_local_model.infer(np.zeros((args.height, args.width, 3), np.uint8))
+        print(f"[Device] Model backend: {tracker.roboflow_local_model.onnx_session.get_providers()[0]}")
+
+
+def _run_dual_camera(args, source):
+    """--source2: track both end cameras at once (DualCameraTracker)."""
+    if args.target_class_id == -1:
+        raise SystemExit("--source2 follows one ball per camera, so --target-class-id -1 (track every class) isn't supported with it")
+    missing = [flag for flag, corners in (("--court-corners", args.court_corners), ("--court-corners2", args.court_corners2)) if not corners]
+    if missing:
+        print(
+            f"[Dual] No {' or '.join(missing)}: tracking both feeds, but court positions and line calls need both "
+            "cameras calibrated (--calibrate --court-length 22 on each)"
+        )
+
+    tracker_a = _build_tracker(args, args.court_corners, camera_id="A")
+    # One copy of the detection model serves both cameras (see _LOCAL_MODEL_LOCK).
+    tracker_b = _build_tracker(args, args.court_corners2, camera_id="B", shared_roboflow_model=tracker_a.roboflow_local_model)
+    _warm_up(tracker_a, args)
+
+    dual = DualCameraTracker(
+        tracker_a, tracker_b, court_width=args.court_width, half_length=args.court_length, agreement_ft=args.bounce_agreement_ft
+    )
+    calls = dual.run(
+        source_a=source,
+        source_b=args.source2,
+        output_path=args.output,
+        raw_output_a=args.raw_output,
+        raw_output_b=args.raw_output2,
+        show_window=args.show,
+        record_fps=args.record_fps,
+        flips={"A": (args.flip_horizontal, args.flip_vertical), "B": (args.flip_horizontal2, args.flip_vertical2)},
+        stats_csv=(args.stats_csv or f"logs/session_{time.strftime('%Y%m%d_%H%M%S')}_dual.csv") if args.stats else None,
+    )
+
+    confirmed = [call for call in calls if call.status == "CONFIRMED"]
+    print(
+        f"\n[Summary] {len(calls)} line calls: {len(confirmed)} confirmed by both cameras, "
+        f"{len(calls) - len(confirmed)} from one camera only (less reliable)."
+    )
+    if confirmed:
+        gap = float(np.median([call.camera_gap_ft for call in confirmed]))
+        print(f"[Summary] Median gap between the two cameras' positions on confirmed bounces: {gap:.2f} ft (how well the calibrations agree)")
+    if dual.fusion.ignored_in_air:
+        print(
+            f"[Summary] {dual.fusion.ignored_in_air} bounce flags ignored: the other camera saw the ball in the air (a hit or the top "
+            "of an arc). If real bounces are being ignored, check the calibrations agree (--check-alignment) or raise --bounce-agreement-ft."
+        )
 
 
 def main():
     args = parse_args()
+    if args.court_length is None:
+        # Each end camera in the dual setup is calibrated for its own half.
+        args.court_length = 22.0 if (args.source2 is not None and not args.calibrate) else 44.0
 
     source = args.source
     if isinstance(source, str) and source.isdigit():
@@ -2120,8 +2955,8 @@ def main():
         return
 
     if args.check_alignment:
-        if not (args.court_corners and args.source2 and args.court_corners2):
-            raise SystemExit("--check-alignment requires --court-corners, --source2, and --court-corners2 (calibrate both cameras first with --calibrate)")
+        if not args.source2:
+            raise SystemExit("--check-alignment needs --source2, the second end camera (add --court-corners/--court-corners2 for the calibration checks)")
         check_dual_camera_alignment(
             source,
             args.source2,
@@ -2140,53 +2975,12 @@ def main():
         )
         return
 
-    court_points = CourtMapper.parse_corners(args.court_corners) if args.court_corners else None
-    court_mapper = (
-        CourtMapper(src_points=court_points, court_width=args.court_width, court_length=args.court_length)
-        if court_points is not None
-        else None
-    )
+    if args.source2 is not None:
+        _run_dual_camera(args, source)
+        return
 
-    tracker = PickleVisionTracker(
-        model_name=args.model,
-        tracker_config=args.tracker,
-        conf=args.conf,
-        reacquire_conf=args.reacquire_conf,
-        iou=args.iou,
-        court_mapper=court_mapper,
-        target_fps=args.fps,
-        target_width=args.width,
-        target_height=args.height,
-        max_missed_frames=args.max_missed_frames,
-        max_match_distance=args.match_distance,
-        require_ball_color=not args.no_color_filter,
-        exclude_people=not args.no_exclude_people,
-        ball_color_min_ratio=args.ball_color_min_ratio,
-        min_box_dimension=args.min_box_dimension,
-        min_aspect_ratio=args.min_aspect_ratio,
-        device=args.device,
-        imgsz=args.imgsz,
-        zoom_to_court=args.zoom,
-        zoom_padding=args.zoom_padding,
-        target_class_id=None if args.target_class_id == -1 else args.target_class_id,
-        use_roboflow=args.use_roboflow,
-        roboflow_api_url=args.roboflow_api_url,
-        roboflow_api_key=args.roboflow_api_key,
-        roboflow_workspace_name=args.roboflow_workspace,
-        roboflow_model_id=args.roboflow_model_id,
-        roboflow_workflow_id=args.roboflow_workflow_id,
-        roboflow_infer_size=args.roboflow_infer_size,
-        roboflow_local=args.roboflow_local,
-        smoothing=args.smoothing,
-        bounce_min_dy=args.bounce_min_dy,
-    )
-    print(f"[Device] Running inference on: {tracker.device}")
-    if tracker.roboflow_local_model is not None:
-        # Warm up here so the one-time TensorRT engine build (or CUDA init)
-        # happens before the camera opens, not as a multi-minute freeze on
-        # the first live frame.
-        tracker.roboflow_local_model.infer(np.zeros((args.height, args.width, 3), np.uint8))
-        print(f"[Device] Model backend: {tracker.roboflow_local_model.onnx_session.get_providers()[0]}")
+    tracker = _build_tracker(args, args.court_corners)
+    _warm_up(tracker, args)
 
     events = tracker.run_video(
         source=source,
