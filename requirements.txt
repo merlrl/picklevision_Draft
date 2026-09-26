@@ -1,4 +1,5 @@
-# Tested on Windows 11, Python 3.12, NVIDIA RTX 4060 Laptop (driver 616.92).
+# Tested on Windows 11, Python 3.12, NVIDIA RTX 4060 Laptop (driver 616.92),
+# and RTX 4050 Laptop (driver 610.62).
 # No CUDA Toolkit or cuDNN install needed -- the NVIDIA libraries come from pip.
 #
 # Install in this order (inference drags the CPU-only onnxruntime back in, which
@@ -7,11 +8,20 @@
 #   pip uninstall -y onnxruntime
 #   pip install "onnxruntime-gpu[cuda,cudnn]==1.21.1" nvidia-cudnn-cu12==9.7.1.26
 #   pip install tensorrt-cu12-libs==10.8.0.43        # optional: TensorRT FP16
+#   pip install --no-deps torch==2.14.0+cu130 torchvision==0.29.0+cu130 --index-url https://download.pytorch.org/whl/cu130
 #
 # With TensorRT installed, tracker.py uses it automatically. The FIRST launch
 # builds an optimized engine for the GPU (~4-5 min, once); later launches
 # reuse it (~17s). 10.8 matches what onnxruntime-gpu 1.21 was built against.
 # Set PICKLEVISION_TENSORRT=0 to run on plain CUDA instead.
+#
+# The last step swaps the CPU torch below for its GPU build (CUDA 13.0 -- there
+# is no CUDA 12 build of torch 2.14; ~2.5GB). torch runs the person filter,
+# which is on by default, and the generic yolov8n.pt path: on the CPU build
+# the filter alone cost ~60ms per frame per camera. Measured on an RTX 4050
+# Laptop with 720p footage: single camera 26 -> 68 fps, both end cameras
+# (--source2) 14 -> 38 pairs/s, CPU load 100% -> ~20%. tracker.py handles
+# torch's cuDNN and onnxruntime's sharing the process -- see its preload comment.
 #
 # `pip check` will then say "inference requires onnxruntime, which is not
 # installed" -- harmless, onnxruntime-gpu provides the same module.
@@ -28,7 +38,12 @@ inference-sdk==1.5.2
 ultralytics==8.4.146
 lap==0.5.13
 
-# CPU build, the version pip resolved alongside inference (tested). Only used by
-# the generic yolov8n.pt path and the optional person filter, not --roboflow-local.
+# CPU build from PyPI, the version pip resolved alongside inference (tested).
+# The last install step above replaces it with the matching GPU build.
 torch==2.14.0
 torchvision==0.29.0
+
+# --stats: the tracker's own CPU/RAM use (psutil) and GPU utilization,
+# temperature and power (pynvml, from nvidia-ml-py).
+psutil==7.2.2
+nvidia-ml-py==12.575.51
