@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import io
+import json
 import os
 import threading
 import time
@@ -441,14 +442,115 @@ class BallEvent:
     camera_id: str = "cam0"
 
 
+class LensModel:
+    """One camera's lens distortion -- the barrel ("fisheye") bend of a
+    wide-angle USB lens that makes straight court lines bow outward -- from
+    --calibrate-lens.
+
+    OpenCV's radial model (k1, k2) about the image center with a nominal focal
+    length, fitted to the court's own painted lines (straight in reality), so
+    no checkerboard is needed. That recovers the *shape* of the bend but not
+    the true focal length, which is all straightening needs: straightened
+    pixels use the same camera matrix, so they keep the raw image's scale and
+    center (and a point on the center stays put).
+
+    Only valid for the capture mode it was fitted in -- USB cameras change
+    their field of view between resolutions.
+    """
+
+    _UNDISTORT_CRITERIA = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 50, 1e-7)
+
+    def __init__(self, k1, k2, width, height, focal=None):
+        self.width, self.height = int(width), int(height)
+        self.focal = float(focal) if focal else 0.75 * max(self.width, self.height)
+        self.K = np.array(
+            [[self.focal, 0.0, self.width / 2.0], [0.0, self.focal, self.height / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        self.D = np.array([k1, k2, 0.0, 0.0, 0.0], dtype=np.float64)
+
+    @classmethod
+    def load(cls, path):
+        data = json.loads(Path(path).read_text())
+        return cls(data["k1"], data["k2"], data["width"], data["height"], data.get("focal"))
+
+    def save(self, path, **extra):
+        data = {"width": self.width, "height": self.height, "k1": float(self.D[0]), "k2": float(self.D[1]), "focal": self.focal}
+        Path(path).write_text(json.dumps({**data, **extra}, indent=2))
+
+    def undistort(self, points):
+        """Raw camera pixels -> straightened pixels, (N, 2) -> (N, 2)."""
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 1, 2)
+        return cv2.undistortPointsIter(pts, self.K, self.D, None, self.K, self._UNDISTORT_CRITERIA).reshape(-1, 2)
+
+    def distort(self, points):
+        """Straightened pixels -> raw camera pixels (the inverse of undistort)."""
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        normalized = (pts - self.K[:2, 2]) / self.focal
+        rays = np.hstack([normalized, np.ones((len(pts), 1))])
+        image, _ = cv2.projectPoints(rays, np.zeros(3), np.zeros(3), self.K, self.D)
+        return image.reshape(-1, 2)
+
+
+def fit_lens_from_lines(lines, width, height):
+    """Fit a LensModel that makes every clicked line straight.
+
+    lines: point lists, each clicked along one line that's straight in reality
+    (>= 3 points each). Returns (lens, rms_before_px, rms_after_px): how far,
+    on average, the clicked points sit off a straight line through them, raw
+    vs straightened.
+
+    Each line's straightness is measured relative to its own length, so the
+    fit can't cheat by shrinking everything toward the center. A line through
+    the image center is straight under any radial bend and carries no
+    information -- lines near the edges, where the bend is strongest, matter
+    most. k2 is only fitted with enough lines to support it.
+    """
+    from scipy.optimize import least_squares
+
+    lines = [np.asarray(line, dtype=np.float64) for line in lines if len(line) >= 3]
+    use_k2 = len(lines) >= 4 and sum(len(line) for line in lines) >= 16
+
+    def straightness(lens):
+        residuals = []
+        for raw in lines:
+            pts = lens.undistort(raw) if lens is not None else raw
+            if not np.all(np.isfinite(pts)):
+                return np.full(sum(len(line) for line in lines), 1e3)
+            centered = pts - pts.mean(axis=0)
+            _, singular, vt = np.linalg.svd(centered, full_matrices=False)
+            raw_spread = np.linalg.svd(raw - raw.mean(axis=0), compute_uv=False)[0]
+            residuals.append((centered @ vt[1]) * (raw_spread / max(singular[0], 1e-9)))
+        return np.concatenate(residuals)
+
+    def lens_for(params):
+        return LensModel(params[0], params[1] if use_k2 else 0.0, width, height)
+
+    result = least_squares(
+        lambda params: straightness(lens_for(params)),
+        x0=np.zeros(2 if use_k2 else 1),
+        bounds=([-1.0] * (2 if use_k2 else 1), [1.0] * (2 if use_k2 else 1)),
+    )
+    lens = lens_for(result.x)
+    rms_before = float(np.sqrt(np.mean(straightness(None) ** 2)))
+    rms_after = float(np.sqrt(np.mean(straightness(lens) ** 2)))
+    return lens, rms_before, rms_after
+
+
 class CourtMapper:
     """Simple homography-based court calibration for a single camera.
 
     The default mapping assumes the full image is treated as a court rectangle in normalized coordinates.
     If a real court is visible, the user can pass four image corners using --court-corners to calibrate it.
+
+    With a lens model (--lens), every image point -- the clicked corners and
+    each ball position -- is straightened before the homography, since a
+    homography can only map straight lines to straight lines: without it, a
+    wide-angle lens's bend makes the mapping exact at the 4 clicked corners
+    and off everywhere between. Callers always pass and get raw camera pixels
+    either way; src_points stay as clicked.
     """
 
-    def __init__(self, src_points=None, dst_points=None, court_width=20.0, court_length=44.0):
+    def __init__(self, src_points=None, dst_points=None, court_width=20.0, court_length=44.0, lens=None):
         if src_points is None:
             src_points = np.array([[0, 0], [1920, 0], [1920, 1080], [0, 1080]], dtype=np.float32)
 
@@ -464,7 +566,9 @@ class CourtMapper:
         self.dst_points = np.array(dst_points, dtype=np.float32)
         self.court_width = court_width
         self.court_length = court_length
-        self.h_matrix = cv2.getPerspectiveTransform(self.src_points, self.dst_points)
+        self.lens = lens
+        straight_src = lens.undistort(self.src_points).astype(np.float32) if lens is not None else self.src_points
+        self.h_matrix = cv2.getPerspectiveTransform(straight_src, self.dst_points)
 
     @staticmethod
     def parse_corners(raw_value):
@@ -494,8 +598,17 @@ class CourtMapper:
             return None
 
         src_point = np.array([[point[0], point[1]]], dtype=np.float32)
+        if self.lens is not None:
+            src_point = self.lens.undistort(src_point).astype(np.float32)
         mapped = cv2.perspectiveTransform(src_point[None, :, :], self.h_matrix)[0][0]
         return float(mapped[0]), float(mapped[1])
+
+    def image_points(self, court_points):
+        """Court coordinates (ft) -> raw camera pixels, (N, 2) -> (N, 2): the
+        inverse of map_point, for drawing the court over the camera image."""
+        pts = np.asarray(court_points, dtype=np.float32).reshape(-1, 1, 2)
+        straight = cv2.perspectiveTransform(pts, np.linalg.inv(self.h_matrix)).reshape(-1, 2)
+        return self.lens.distort(straight) if self.lens is not None else straight
 
     def classify(self, point):
         if point is None:
@@ -589,6 +702,10 @@ class PickleVisionTracker:
     # A static candidate is still accepted if it's this close to the tracked
     # ball's last position -- i.e. the ball being followed has come to rest.
     STATIC_KEEP_RADIUS_PX = 25.0
+    # Line calls: a new one within CALL_REPEAT_FRAMES of the last is the same
+    # bounce; the on-screen banner stays up for CALL_BANNER_SECONDS.
+    CALL_REPEAT_FRAMES = 15
+    CALL_BANNER_SECONDS = 2.0
     # Gap prediction (see _fit_motion): how many recent real detections to
     # fit, the minimum needed to fit at all, and the polynomial degree in y.
     # Chosen by simulated-gap benchmark (noisy ballistic shots, 5-15 hidden
@@ -728,6 +845,13 @@ class PickleVisionTracker:
         self.events: list[BallEvent] = []
         self.frame_index = 0
         self.court_mapper = court_mapper or CourtMapper()
+        # Only a real --court-corners calibration is drawn over the feed and
+        # gives meaningful calls; the default mapper is a placeholder.
+        self.court_calibrated = court_mapper is not None
+        self._court_overlay = None
+        # The latest line call, for run_video's on-screen banner and terminal
+        # log: {"call", "court" (x, y ft), "frame_index", "time", "new"}.
+        self.last_call = None
         # False when running on the default full-frame CourtMapper above,
         # whose "court" is just the whole image.
         self.court_calibrated = court_mapper is not None
@@ -863,6 +987,42 @@ class PickleVisionTracker:
             return recent[-1]
 
         return None
+
+    def _court_position(self, point):
+        """A point in the frame process_frame works on -> court (x, y) in ft."""
+        if self.zoom_roi is not None:
+            point = (point[0] + self.zoom_roi[0], point[1] + self.zoom_roi[1])
+        return self.court_mapper.map_point(point)
+
+    def _draw_court_and_call(self, frame):
+        """run_video's single-camera overlay: the calibrated court's lines (bent
+        with the lens, if there is one) and the latest line call as a banner
+        for CALL_BANNER_SECONDS. Drawn after detection, never into its input."""
+        if self.court_calibrated:
+            if self._court_overlay is None:
+                offset = np.array(self.zoom_roi[:2] if self.zoom_roi is not None else (0, 0), dtype=np.float64)
+                self._court_overlay = [
+                    (tuple(np.round(np.array(a) - offset).astype(int)), tuple(np.round(np.array(b) - offset).astype(int)))
+                    for a, b in _court_reference_lines(self.court_mapper)
+                ]
+            for a, b in self._court_overlay:
+                cv2.line(frame, a, b, (255, 255, 0), 1)
+
+        call = self.last_call
+        if call is None or time.perf_counter() - call["time"] > self.CALL_BANNER_SECONDS:
+            return
+        color = (0, 200, 0) if call["call"] == "IN" else (0, 0, 255)
+        x_ft, y_ft = call["court"]
+        from_edge = "the net" if abs(self.court_mapper.court_length - 44.0) >= 1.0 else "the far baseline"
+        _draw_label(frame, call["call"], (frame.shape[1] // 2 - 40, 60), color, scale=1.8, thickness=4)
+        _draw_label(
+            frame,
+            f"{x_ft:.1f} ft from the left sideline, {y_ft:.1f} ft from {from_edge}",
+            (frame.shape[1] // 2 - 200, 95),
+            color,
+            scale=0.55,
+            thickness=1,
+        )
 
     def _classify_in_out(self, court_point):
         """Use homography-based court mapping to assign a line-call result.
@@ -1272,6 +1432,16 @@ class PickleVisionTracker:
                     camera_id=self.camera_id,
                 )
             )
+            # One bounce trips _detect_ball_contact on a few consecutive frames;
+            # announce it once.
+            if self.last_call is None or self.frame_index - self.last_call["frame_index"] > self.CALL_REPEAT_FRAMES:
+                self.last_call = {
+                    "call": call,
+                    "court": self._court_position(landing_point),
+                    "frame_index": self.frame_index,
+                    "time": time.perf_counter(),
+                    "new": True,
+                }
 
         box_color = (0, 165, 255) if predicted else (0, 255, 0)
         label = f"Ball ID: {self.display_track_id}" + (" (predicted)" if predicted else "")
@@ -1720,6 +1890,11 @@ class PickleVisionTracker:
                 annotated = self.process_frame(frame)
                 if stats is not None:
                     stats.frame_done(arrived_at)
+                self._draw_court_and_call(annotated)
+                if self.last_call is not None and self.last_call["new"]:
+                    self.last_call["new"] = False
+                    x_ft, y_ft = self.last_call["court"]
+                    print(f"[Call] {self.last_call['call']} -- court position x={x_ft:.1f} ft, y={y_ft:.1f} ft (frame {self.last_call['frame_index']})")
 
                 if writer is not None or raw_writer is not None:
                     expected_frames = int((time.time() - record_start) * effective_record_fps)
@@ -2277,6 +2452,10 @@ def parse_args():
     parser.add_argument("--width", type=int, default=1280, help="Target camera width in pixels (default: 1280 -- 720p, the target for multi-camera headroom; 1920 for 1080p). Calibrate at the same size you track at")
     parser.add_argument("--height", type=int, default=720, help="Target camera height in pixels (default: 720; 1080 for 1080p)")
     parser.add_argument("--court-corners", type=str, default=None, help="Court calibration: x1 y1 x2 y2 x3 y3 x4 y4 (TL TR BR BL)")
+    parser.add_argument("--calibrate-lens", action="store_true", help="Interactively measure the camera lens's fisheye/barrel bend by clicking points along straight court lines, save it (--lens-output), then exit. Use the result with --lens")
+    parser.add_argument("--lens-output", type=str, default=None, help="Where --calibrate-lens saves the lens file (default: lens_cam<source>.json)")
+    parser.add_argument("--lens", type=str, default=None, help="Lens file from --calibrate-lens for --source's camera: straightens its wide-angle bend before court mapping, so calibration and line calls match the real lines across the whole image. Use it for --calibrate as well as tracking, at the same --width/--height")
+    parser.add_argument("--lens2", type=str, default=None, help="Lens file from --calibrate-lens for --source2's camera")
     parser.add_argument("--max-missed-frames", type=int, default=15, help="Frames to keep extrapolating the ball's position through a detection gap (e.g. motion blur) before dropping the track")
     parser.add_argument("--stats", action="store_true", help="Log performance and resources: startup time, fps, frame latency, CPU/RAM, GPU utilization/temperature/power. Prints every 5s plus a summary at the end, and saves a per-second CSV (see --stats-csv). With --source2, fps counts camera pairs per second")
     parser.add_argument("--stats-csv", type=str, default=None, help="CSV path for --stats (default: logs/session_<date>_<time>_cam<source>.csv)")
@@ -2458,14 +2637,50 @@ def _court_reference_lines(mapper: CourtMapper, include_far_half: bool = False):
                 ((center_x, far_kitchen_y), (center_x, far_baseline_y)),
             ]
 
-    endpoints = np.array(segments, dtype=np.float32).reshape(-1, 1, 2)
-    inv_h = np.linalg.inv(mapper.h_matrix)
-    mapped = cv2.perspectiveTransform(endpoints, inv_h).reshape(-1, 2, 2)
-    return [(tuple(pair[0]), tuple(pair[1])) for pair in mapped]
+    # With a lens model a straight court line is curved in the camera image,
+    # so each one comes back as short pieces along its length (drawn the same
+    # way by callers) that follow the bend of the real painted line.
+    samples = 2 if mapper.lens is None else 25
+    t = np.linspace(0.0, 1.0, samples)[:, None]
+    pieces = []
+    for start, end in segments:
+        court_pts = np.array(start) + (np.array(end) - np.array(start)) * t
+        image_pts = mapper.image_points(court_pts)
+        pieces += [(tuple(a), tuple(b)) for a, b in zip(image_pts[:-1], image_pts[1:])]
+    return pieces
 
 
-def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0, flip_horizontal=False, flip_vertical=False, target_width: int = 1920, target_height: int = 1080, target_fps: int = 120):
+def _draw_loupe(display, frame, cursor, zoom=4, radius=24):
+    """A magnified view of the unannotated frame around the mouse, with a
+    crosshair, for clicking a line's exact edge or corner. Drawn in the top
+    right corner, or the top left when the mouse is over that corner."""
+    if cursor is None:
+        return
+    height, width = frame.shape[:2]
+    x, y = cursor
+    if not (0 <= x < width and 0 <= y < height):
+        return
+    x0, y0 = max(0, x - radius), max(0, y - radius)
+    patch = frame[y0 : min(height, y + radius + 1), x0 : min(width, x + radius + 1)]
+    big = cv2.resize(patch, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_NEAREST)
+    cx, cy = (x - x0) * zoom + zoom // 2, (y - y0) * zoom + zoom // 2
+    cv2.line(big, (cx, 0), (cx, big.shape[0]), (0, 0, 255), 1)
+    cv2.line(big, (0, cy), (big.shape[1], cy), (0, 0, 255), 1)
+    big_h, big_w = big.shape[:2]
+    left = 10 if (x > width - big_w - 30 and y < big_h + 30) else width - big_w - 10
+    if big_h + 10 > height or left < 0:
+        return
+    display[10 : 10 + big_h, left : left + big_w] = big
+    cv2.rectangle(display, (left, 10), (left + big_w, 10 + big_h), (255, 255, 255), 1)
+
+
+def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0, flip_horizontal=False, flip_vertical=False, target_width: int = 1920, target_height: int = 1080, target_fps: int = 120, lens: "LensModel | None" = None):
     """Interactively click the court's 4 real-world corners on a live camera feed.
+
+    With lens (--lens, from --calibrate-lens) the preview is lens-corrected:
+    the green outline and cyan lines curve to follow the real painted lines.
+    The saved corners are still the raw pixels clicked, so they're used with
+    the same --lens when tracking.
 
     Click order matters -- it must match CourtMapper's default destination
     rectangle (TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT, i.e. clockwise
@@ -2501,8 +2716,10 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
         print(f"[Camera Config] Requesting {target_width}x{target_height} @ {target_fps}fps (MJPEG) -> got {actual_width}x{actual_height}")
 
     clicked: list[tuple[int, int]] = []
+    cursor: list[tuple[int, int]] = []
 
     def on_click(event, x, y, flags, param):
+        cursor[:] = [(x, y)]
         if event == cv2.EVENT_LBUTTONDOWN and len(clicked) < 4:
             clicked.append((x, y))
 
@@ -2512,6 +2729,7 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
 
     far_edge_label = "the NET line" if abs(court_length - 44.0) >= 1.0 else "the FAR baseline"
     print(f"Calibrating a {court_width:.0f}x{court_length:.0f} ft region.")
+    print("Lens correction: " + ("ON" if lens is not None else "off (add --lens from --calibrate-lens for a wide-angle lens)"))
     print(f"Click in order: TOP-LEFT, TOP-RIGHT ({far_edge_label}), then BOTTOM-RIGHT, BOTTOM-LEFT (the NEAR baseline).")
     print("Keys: 'r' reset points | 's' save (once 4 are placed) | 'q' cancel")
 
@@ -2526,6 +2744,11 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
             if flip_horizontal or flip_vertical:
                 flip_code = -1 if (flip_horizontal and flip_vertical) else (1 if flip_horizontal else 0)
                 frame = cv2.flip(frame, flip_code)
+            if lens is not None and (frame.shape[1], frame.shape[0]) != (lens.width, lens.height):
+                raise SystemExit(
+                    f"--lens was fitted at {lens.width}x{lens.height} but this feed is {frame.shape[1]}x{frame.shape[0]} "
+                    "-- use the same --width/--height, or redo --calibrate-lens at this resolution"
+                )
 
             display = frame.copy()
             for i, pt in enumerate(clicked):
@@ -2533,8 +2756,9 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
                 cv2.putText(display, str(i + 1), (pt[0] + 8, pt[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             if len(clicked) == 4:
-                pts = np.array(clicked, dtype=np.int32)
-                cv2.polylines(display, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+                if lens is None:
+                    pts = np.array(clicked, dtype=np.int32)
+                    cv2.polylines(display, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
                 cv2.putText(display, "Press 's' to save, 'r' to reset", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 try:
@@ -2542,7 +2766,15 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
                         src_points=np.array(clicked, dtype=np.float32),
                         court_width=court_width,
                         court_length=court_length,
+                        lens=lens,
                     )
+                    if lens is not None:
+                        # The outline between the clicked corners, bent like the real lines.
+                        corners = preview_mapper.dst_points
+                        t = np.linspace(0.0, 1.0, 25)[:, None]
+                        for a, b in zip(corners, np.roll(corners, -1, axis=0)):
+                            edge = preview_mapper.image_points(a + (b - a) * t).astype(np.int32)
+                            cv2.polylines(display, [edge], isClosed=False, color=(0, 255, 0), thickness=2)
                     for (lx1, ly1), (lx2, ly2) in _court_reference_lines(preview_mapper):
                         cv2.line(display, (int(lx1), int(ly1)), (int(lx2), int(ly2)), (255, 255, 0), 1)
                     cv2.putText(
@@ -2567,6 +2799,7 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
             else:
                 cv2.putText(display, f"Click corner {len(clicked) + 1}/4", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
+            _draw_loupe(display, frame, cursor[0] if cursor else None)
             cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -2592,6 +2825,186 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
     return corner_str
 
 
+_LENS_LINE_COLORS = [(0, 200, 255), (255, 0, 255), (0, 255, 0), (255, 128, 0), (128, 0, 255), (0, 128, 255), (255, 255, 255)]
+
+# --calibrate-lens walks through these in order (an end camera's view of its
+# half), then takes optional extra lines. The bend is strongest near the
+# image edges, which the sidelines and baseline reach.
+_LENS_LINE_PLAN = ["the NEAR BASELINE", "the LEFT SIDELINE", "the RIGHT SIDELINE", "the KITCHEN LINE", "the CENTERLINE"]
+_LENS_POINTS_PER_LINE = 5
+
+
+def calibrate_lens(source, save_path, flip_horizontal=False, flip_vertical=False, target_width=1280, target_height=720, target_fps=120):
+    """--calibrate-lens: measure a wide-angle lens's bend from straight court lines.
+
+    Guided and mouse-only: the window names the line to click next (near
+    baseline, both sidelines, kitchen line, centerline), and after
+    _LENS_POINTS_PER_LINE clicks spread along it moves on to the next by
+    itself. From the 2nd line on, the bend is fitted and each line's fitted
+    straight line is drawn back over the feed in cyan, bent the way this lens
+    bends it: it should run along the real paint. From the 3rd line on the
+    result is saved automatically after every line, so closing the window
+    keeps it. After the planned lines, any other straight line (a fence rail,
+    a wall edge -- ideally near the image edges) can be added the same way.
+
+    Optional keys (calibration window focused): right-click or 'n' ends a
+    line early (3+ points), 'u' undo, 'r' reset, 'v' straightened view,
+    'q' close. Returns the saved LensModel, or None if nothing was saved.
+    """
+    cap, _ = _open_video_source(source, target_width, target_height, target_fps)
+    lines: list[list[tuple[int, int]]] = [[]]
+    cursor: list[tuple[int, int]] = []
+    state = {"straight": False, "fit": None, "fit_key": None, "maps": None, "saved": None, "quit_armed": False}
+
+    def next_line():
+        if len(lines[-1]) >= 3:
+            lines.append([])
+
+    def on_mouse(event, x, y, flags, param):
+        cursor[:] = [(x, y)]
+        if state["straight"]:
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            state["quit_armed"] = False
+            lines[-1].append((x, y))
+            if len(lines[-1]) >= _LENS_POINTS_PER_LINE:
+                next_line()
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            next_line()
+
+    window = "Lens Calibration"
+    cv2.namedWindow(window)
+    cv2.setMouseCallback(window, on_mouse)
+    print(f"Click {_LENS_POINTS_PER_LINE} points spread along each line the window names -- it moves to the next line by itself.")
+    print(f"From the 3rd line on it saves automatically to {save_path}; close the window (or 'q') when the cyan lines follow the paint.")
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("Failed to read frame from camera.")
+                break
+            frame = _flip_frame(frame, flip_horizontal, flip_vertical)
+            height, width = frame.shape[:2]
+
+            usable = [line for line in lines if len(line) >= 3]
+            fit_key = tuple(tuple(line) for line in usable)
+            if len(usable) < 2:
+                state["fit"] = state["fit_key"] = None
+                state["straight"] = False
+            elif fit_key != state["fit_key"]:
+                state["fit"] = fit_lens_from_lines(usable, width, height)
+                state["fit_key"], state["maps"] = fit_key, None
+                if len(usable) >= 3:
+                    lens, before, after = state["fit"]
+                    lens.save(
+                        save_path,
+                        method="court lines (plumb-line fit)",
+                        lines=len(usable),
+                        points=sum(len(line) for line in usable),
+                        rms_before_px=round(before, 2),
+                        rms_after_px=round(after, 2),
+                    )
+                    state["saved"] = state["fit"]
+            fit = state["fit"]
+            lens = fit[0] if fit is not None else None
+            straight_view = state["straight"] and lens is not None
+
+            if straight_view:
+                if state["maps"] is None:
+                    state["maps"] = cv2.initUndistortRectifyMap(lens.K, lens.D, None, lens.K, (width, height), cv2.CV_16SC2)
+                display = cv2.remap(frame, *state["maps"], cv2.INTER_LINEAR)
+            else:
+                display = frame.copy()
+
+            for i, line in enumerate(lines):
+                if not line:
+                    continue
+                color = _LENS_LINE_COLORS[i % len(_LENS_LINE_COLORS)]
+                pts = np.array(line, dtype=np.float64)
+                shown = lens.undistort(pts) if straight_view else pts
+                for x, y in shown:
+                    cv2.circle(display, (int(round(x)), int(round(y))), 4, color, -1)
+                if lens is not None and len(line) >= 3:
+                    # The straight line through this line's points, drawn as
+                    # the lens bends it (or straight, in the straightened view).
+                    straight = lens.undistort(pts)
+                    center = straight.mean(axis=0)
+                    direction = np.linalg.svd(straight - center)[2][0]
+                    along = (straight - center) @ direction
+                    span = np.linspace(along.min(), along.max(), 40)[:, None]
+                    segment = center + span * direction
+                    curve = segment if straight_view else lens.distort(segment)
+                    cv2.polylines(display, [curve.astype(np.int32)], False, (255, 255, 0), 1)
+
+            index, current = len(lines) - 1, len(lines[-1])
+            planned = len(_LENS_LINE_PLAN)
+            if index < planned:
+                step = f"STEP {index + 1} of {planned}: click {_LENS_POINTS_PER_LINE} points spread along {_LENS_LINE_PLAN[index]}"
+            else:
+                step = f"All {planned} lines done! Optional extra: any other straight line (fence rail, wall edge)"
+            status = [(f"{step}  ({current}/{_LENS_POINTS_PER_LINE} points)", (0, 255, 255))]
+            if index > 0 and current == 0:
+                previous = _LENS_LINE_PLAN[index - 1] if index - 1 < planned else "that line"
+                status.append((f"{previous[4:].capitalize() if previous.startswith('the ') else previous} done!", (0, 255, 0)))
+            if fit is not None:
+                _, before, after = fit
+                status.append((f"Lens bend: {before:.1f} px off straight -> {after:.1f} px corrected. Cyan lines should follow the paint.", (0, 255, 255)))
+            if state["quit_armed"]:
+                status.append(("NOT SAVED YET -- press 'q' again to quit WITHOUT saving, or keep clicking", (0, 0, 255)))
+            elif state["saved"] is not None:
+                done_note = "all lines done -- close the window" if index >= planned else "keep going for the best result, or close the window"
+                status.append((f"SAVED to {save_path} -- {done_note}", (0, 255, 0)))
+            else:
+                remaining = 3 - len(usable)
+                status.append((f"NOT SAVED YET -- finish {remaining} more line{'s' if remaining != 1 else ''} (it saves by itself after line 3)", (0, 128, 255)))
+            for i, (text, color) in enumerate(status):
+                _draw_label(display, text, (10, 28 + 26 * i), color)
+            if straight_view:
+                _draw_label(display, "STRAIGHTENED VIEW -- press 'v' to go back to clicking", (10, height - 15), (255, 255, 0))
+            else:
+                _draw_loupe(display, frame, cursor[0] if cursor else None)
+
+            cv2.imshow(window, display)
+            key = cv2.waitKey(1) & 0xFF
+            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            if key in (ord("q"), ord("s")):
+                # Quitting before anything is saved needs a second press: it's
+                # easy to take the next line's "0/5" for "finished".
+                if state["saved"] is not None or state["quit_armed"]:
+                    break
+                state["quit_armed"] = True
+            elif key != 255:
+                state["quit_armed"] = False
+            if key == ord("n"):
+                next_line()
+            if key == ord("u"):
+                if lines[-1]:
+                    lines[-1].pop()
+                elif len(lines) > 1:
+                    lines.pop()  # back into the previous line
+                    lines[-1].pop()
+            if key == ord("r"):
+                lines[:] = [[]]
+                state["saved"] = None
+            if key == ord("v") and lens is not None:
+                state["straight"] = not state["straight"]
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    if state["saved"] is None:
+        print("Lens calibration closed before 3 lines were done -- nothing saved.")
+        return None
+    lens, before, after = state["saved"]
+    print(f"Lens bend: {before:.1f} px off straight -> {after:.1f} px after correction (k1 {lens.D[0]:+.4f}, k2 {lens.D[1]:+.4f})")
+    if before < 1.0:
+        print("Note: the lines were barely bent -- if they were all near the image center, add lines near the edges.")
+    print(f"Saved to {save_path}. Use it with --lens {save_path} (court calibration, tracking; --lens2 for --source2's camera).")
+    return lens
+
+
 def _aim_readout(mapper: CourtMapper, frame_width: int):
     """How far a half-court-calibrated end camera is from looking straight
     down the court's centerline, from its calibration. Measured against the
@@ -2609,6 +3022,10 @@ def _aim_readout(mapper: CourtMapper, frame_width: int):
 
     A level camera centered on the centerline and aimed straight along it
     reads 0 on all of them.
+
+    With a lens model these are measured in the straightened image, which is
+    what the geometry needs; lens bend is radial about the image center, so
+    offsets from the center guide mean the same thing there.
     """
     x_min, x_max = float(np.min(mapper.dst_points[:, 0])), float(np.max(mapper.dst_points[:, 0]))
     y_min, y_max = float(np.min(mapper.dst_points[:, 1])), float(np.max(mapper.dst_points[:, 1]))
@@ -2680,6 +3097,8 @@ def check_dual_camera_alignment(
     target_width: int = 1920,
     target_height: int = 1080,
     target_fps: int = 120,
+    lens_a: "LensModel | None" = None,
+    lens_b: "LensModel | None" = None,
 ):
     """Live setup tool for the 2 end cameras (one behind each baseline, facing
     each other, centered on the centerline), in two stages:
@@ -2704,10 +3123,10 @@ def check_dual_camera_alignment(
     clear both, 'q' to quit.
     """
     mappers = {
-        end: CourtMapper(src_points=CourtMapper.parse_corners(corners), court_width=court_width, court_length=half_length)
+        end: CourtMapper(src_points=CourtMapper.parse_corners(corners), court_width=court_width, court_length=half_length, lens=lens)
         if corners
         else None
-        for end, corners in (("A", corners_a), ("B", corners_b))
+        for end, corners, lens in (("A", corners_a, lens_a), ("B", corners_b, lens_b))
     }
     flips = {"A": (flip_horizontal_a, flip_vertical_a), "B": (flip_horizontal_b, flip_vertical_b)}
     windows = {"A": "Camera A (end)", "B": "Camera B (end)"}
@@ -2827,12 +3246,28 @@ def check_dual_camera_alignment(
         cv2.destroyAllWindows()
 
 
-def _build_tracker(args, court_corners, camera_id="cam0", shared_roboflow_model=None):
+def _load_lens(path, args, flag="--lens"):
+    """The LensModel saved by --calibrate-lens at path, or None if no path.
+    Refuses one fitted at a different resolution than --width/--height: USB
+    cameras change their field of view between modes, so it wouldn't fit."""
+    if not path:
+        return None
+    lens = LensModel.load(path)
+    if (lens.width, lens.height) != (args.width, args.height):
+        raise SystemExit(
+            f"{flag} {path} was fitted at {lens.width}x{lens.height}, but --width/--height is {args.width}x{args.height} "
+            "-- use the same resolution, or redo --calibrate-lens at this one"
+        )
+    print(f"[Lens] {flag} {path}: correcting lens bend (k1 {lens.D[0]:+.4f}, k2 {lens.D[1]:+.4f})")
+    return lens
+
+
+def _build_tracker(args, court_corners, camera_id="cam0", shared_roboflow_model=None, lens=None):
     """A PickleVisionTracker configured from the command line, calibrated with
     court_corners (a --court-corners string), or uncalibrated if it's None."""
     court_points = CourtMapper.parse_corners(court_corners) if court_corners else None
     court_mapper = (
-        CourtMapper(src_points=court_points, court_width=args.court_width, court_length=args.court_length)
+        CourtMapper(src_points=court_points, court_width=args.court_width, court_length=args.court_length, lens=lens)
         if court_points is not None
         else None
     )
@@ -2895,9 +3330,15 @@ def _run_dual_camera(args, source):
             "cameras calibrated (--calibrate --court-length 22 on each)"
         )
 
-    tracker_a = _build_tracker(args, args.court_corners, camera_id="A")
+    tracker_a = _build_tracker(args, args.court_corners, camera_id="A", lens=_load_lens(args.lens, args))
     # One copy of the detection model serves both cameras (see _LOCAL_MODEL_LOCK).
-    tracker_b = _build_tracker(args, args.court_corners2, camera_id="B", shared_roboflow_model=tracker_a.roboflow_local_model)
+    tracker_b = _build_tracker(
+        args,
+        args.court_corners2,
+        camera_id="B",
+        shared_roboflow_model=tracker_a.roboflow_local_model,
+        lens=_load_lens(args.lens2, args, "--lens2"),
+    )
     _warm_up(tracker_a, args)
 
     dual = DualCameraTracker(
@@ -2940,6 +3381,18 @@ def main():
     if isinstance(source, str) and source.isdigit():
         source = int(source)
 
+    if args.calibrate_lens:
+        calibrate_lens(
+            source,
+            save_path=args.lens_output or f"lens_cam{Path(str(args.source)).stem}.json",
+            flip_horizontal=args.flip_horizontal,
+            flip_vertical=args.flip_vertical,
+            target_width=args.width,
+            target_height=args.height,
+            target_fps=args.fps,
+        )
+        return
+
     if args.calibrate:
         calibrate_court_corners(
             source,
@@ -2951,6 +3404,7 @@ def main():
             target_width=args.width,
             target_height=args.height,
             target_fps=args.fps,
+            lens=_load_lens(args.lens, args),
         )
         return
 
@@ -2972,6 +3426,8 @@ def main():
             target_width=args.width,
             target_height=args.height,
             target_fps=args.fps,
+            lens_a=_load_lens(args.lens, args),
+            lens_b=_load_lens(args.lens2, args, "--lens2"),
         )
         return
 
@@ -2979,7 +3435,7 @@ def main():
         _run_dual_camera(args, source)
         return
 
-    tracker = _build_tracker(args, args.court_corners)
+    tracker = _build_tracker(args, args.court_corners, lens=_load_lens(args.lens, args))
     _warm_up(tracker, args)
 
     events = tracker.run_video(
