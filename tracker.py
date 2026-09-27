@@ -11,7 +11,7 @@ import time
 _PROCESS_START = time.perf_counter()
 
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -161,6 +161,35 @@ def _open_video_source(source, target_width, target_height, target_fps):
     return cap, is_live
 
 
+def _timestamps_path(video_path):
+    """Where --record-raw saves a video's per-frame capture times: beside it,
+    raw1.avi -> raw1.timestamps.csv."""
+    path = Path(video_path)
+    return path.with_name(path.stem + ".timestamps.csv")
+
+
+def _load_timestamps(source):
+    """Each frame's capture time (s) for a video --record-raw saved, or None
+    (a live camera, or a video without them)."""
+    if not isinstance(source, (str, Path)):
+        return None
+    path = _timestamps_path(source)
+    if not path.exists():
+        return None
+    return np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)[:, 1]
+
+
+def _delivered_fps(times):
+    """The frame rate a camera really delivered, from its frames' capture
+    times -- a video file's own fps is only the rate it was asked for (an ELP
+    set to 120 delivers 60 or less when dim light lengthens its exposure).
+    The average over the whole video: frames read without a driver timestamp
+    are stamped on arrival, and some cameras hand them over in bursts."""
+    if len(times) < 2 or times[-1] <= times[0]:
+        return None
+    return round((len(times) - 1) / float(times[-1] - times[0]))
+
+
 def _flip_frame(frame, horizontal, vertical):
     """Apply --flip-horizontal/--flip-vertical (or a second camera's own) to a frame."""
     if not (horizontal or vertical):
@@ -188,14 +217,18 @@ class _FrameReader:
     behind, stale frames are dropped so what's processed is always current.
     live=False (a video file) queues every frame, blocking the reader when
     the queue is full, so offline evaluation never skips a frame.
+
+    notify (a threading.Event) is set whenever a frame (or the end) arrives --
+    so one loop can wait on several cameras at once (DualCameraTracker).
     """
 
-    def __init__(self, cap, live, queue_size=4):
+    def __init__(self, cap, live, queue_size=4, notify=None):
         import queue
         import threading
 
         self.cap = cap
         self.live = live
+        self._notify = notify
         self._queue = queue.Queue(maxsize=1 if live else queue_size)
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -207,15 +240,27 @@ class _FrameReader:
         while not self._stopped.is_set():
             try:
                 ok, frame = self.cap.read()
-            except cv2.error:
-                # read() can throw instead of returning False -- seen on the
-                # built-in webcam when asked for a size it doesn't support.
-                # Treated as the source failing; otherwise this thread dies
-                # and the tracking loop waits forever for its next frame.
+            except Exception as error:
+                # read() can throw instead of returning False -- seen (a
+                # cv2.error) on the built-in webcam when asked for a size it
+                # doesn't support. Treated as the source failing; otherwise
+                # this thread dies and the tracking loop waits forever for
+                # its next frame.
+                print(f"[Camera] Reading a frame failed: {error!r}")
                 ok, frame = False, None
             # Arrival time rides along with the frame, so --stats can measure
-            # latency from capture to tracked, queue wait included.
-            item = (frame, time.perf_counter()) if ok else (None, None)
+            # latency from capture to tracked, queue wait included -- and so
+            # does its capture time: a camera's driver (Windows MSMF) stamps
+            # each frame on the same clock as perf_counter. It can be 80-270 ms
+            # before arrival (measured on a laptop webcam, varying frame to
+            # frame), so two cameras' arrival times don't line their frames up.
+            arrival = time.perf_counter()
+            captured = arrival
+            if ok and self.live:
+                driver_time = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if 0.0 <= arrival - driver_time < 2.0:
+                    captured = driver_time
+            item = (frame, arrival, captured) if ok else (None, None, None)
             if self.live:
                 try:
                     self._queue.get_nowait()  # drop the stale frame, if any
@@ -229,16 +274,109 @@ class _FrameReader:
                         break
                     except queue.Full:
                         continue
+            if self._notify is not None:
+                self._notify.set()
             if not ok:
                 return
 
     def read(self):
-        """Next (frame, arrival_time), or (None, None) once the source is exhausted/failed."""
+        """Next (frame, arrival_time, capture_time), or (None, None, None) once
+        the source is exhausted/failed. (A video file's capture_time is just
+        its arrival; _SyncedFrames gives it the real one.)"""
         return self._queue.get()
+
+    def poll(self):
+        """Like read(), but None right away if no frame is waiting."""
+        import queue
+
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def stop(self):
         self._stopped.set()
         self._thread.join(timeout=1.0)
+
+
+class _SyncedFrames:
+    """Each step's new frames from the two end cameras, in time order.
+
+    Live cameras: whichever have delivered a frame since the last step --
+    normally both, but a slower camera (an ELP drops from 120fps to 60 or
+    less when dim light lengthens its exposure) is just processed less often,
+    rather than holding the other one to its pace. Step time = arrival.
+
+    Video files: frames in the order they were captured, by each file's
+    capture times (saved beside it by --record-raw) or else frame number /
+    fps; frames within half a frame period of each other are one step.
+    Pairing frame N with frame N instead drifts apart -- two cameras never
+    deliver exactly the same rate, and each drops frames of its own -- and
+    breaks outright with cameras at different rates.
+    """
+
+    def __init__(self, caps, live, fps, timestamps):
+        import threading
+
+        self.live = live
+        self._arrived = threading.Event()
+        self.readers = {end: _FrameReader(cap, live=live[end], notify=self._arrived) for end, cap in caps.items()}
+        self._fps = fps
+        self._times = timestamps
+        self._count = {end: 0 for end in caps}
+        self._buffered = {}
+        self._tolerance = 0.5 / max(fps.values())
+
+    def next(self):
+        """({camera: (frame, arrival, capture time)} for the cameras with a new
+        frame, step time in s) -- or (None, [the cameras whose source ended])."""
+        if any(self.live.values()):
+            return self._next_live()
+        return self._next_file()
+
+    def _next_live(self):
+        new, waited = {}, 0.0
+        while not new:
+            if not self._arrived.wait(timeout=1.0):
+                waited += 1.0
+                if waited == 3.0:
+                    print("[Dual] No frames from either camera for 3 s -- still waiting (unplugged? 'q' to quit)")
+                continue
+            self._arrived.clear()
+            for end, reader in self.readers.items():
+                item = reader.poll()
+                if item is not None:
+                    new[end] = item
+        ended = [end for end, (frame, _, _) in new.items() if frame is None]
+        if ended:
+            return None, ended
+        return new, min(captured for _, _, captured in new.values())
+
+    def _file_time(self, end):
+        times, index = self._times.get(end), self._count[end]
+        if times is not None and index < len(times):
+            return float(times[index])
+        return index / self._fps[end]
+
+    def _next_file(self):
+        for end, reader in self.readers.items():
+            if end not in self._buffered:
+                self._buffered[end] = (reader.read(), self._file_time(end))
+                self._count[end] += 1
+        ended = [end for end, (item, _) in self._buffered.items() if item[0] is None]
+        if ended:
+            return None, ended
+        t = min(frame_time for _, frame_time in self._buffered.values())
+        new = {}
+        for end, ((frame, arrival, _), frame_time) in list(self._buffered.items()):
+            if frame_time <= t + self._tolerance:
+                new[end] = (frame, arrival, frame_time)
+                del self._buffered[end]
+        return new, t
+
+    def stop(self):
+        for reader in self.readers.values():
+            reader.stop()
 
 
 class _FrameDisplay:
@@ -434,6 +572,9 @@ class BallEvent:
     centroid: tuple[float, float]
     velocity: float = 0.0
     landing_point: tuple[float, float] | None = None
+    # The frame the ball touched down in -- frame_index is when it was
+    # recognized, a few frames later (the detector needs the rise too).
+    landing_frame: int | None = None
     line_call: str = "UNKNOWN"
     timestamp: float = field(default_factory=time.time)
     # Tags which camera produced this event: "A"/"B" in dual-camera mode
@@ -550,11 +691,19 @@ class CourtMapper:
     either way; src_points stay as clicked.
     """
 
-    def __init__(self, src_points=None, dst_points=None, court_width=20.0, court_length=44.0, lens=None):
+    def __init__(self, src_points=None, dst_points=None, court_width=20.0, court_length=44.0, lens=None, view="end"):
         if src_points is None:
             src_points = np.array([[0, 0], [1920, 0], [1920, 1080], [0, 1080]], dtype=np.float32)
 
-        if dst_points is None:
+        if dst_points is None and view == "side":
+            # A camera beside the court (--view side): the TOP edge clicked is
+            # the far SIDELINE and the court's length runs across the image.
+            # Same court coordinates as from an end (x across, y along) -- the
+            # corners are just clicked in a different order.
+            dst_points = np.array(
+                [[court_width, court_length], [court_width, 0], [0, 0], [0, court_length]], dtype=np.float32
+            )
+        elif dst_points is None:
             # court_length=44 covers the full court; pass 22 to scope calibration to
             # just one half (baseline to net) -- useful when only one half is
             # reliably visible/accurate from a given camera angle.
@@ -562,6 +711,7 @@ class CourtMapper:
                 [[0, 0], [court_width, 0], [court_width, court_length], [0, court_length]], dtype=np.float32
             )
 
+        self.view = view
         self.src_points = np.array(src_points, dtype=np.float32)
         self.dst_points = np.array(dst_points, dtype=np.float32)
         self.court_width = court_width
@@ -714,6 +864,21 @@ class PickleVisionTracker:
     PREDICT_FIT_POINTS = 10
     PREDICT_MIN_POINTS = 3
     PREDICT_Y_DEGREE = 2
+    # Bounce detection (see _detect_ball_contact): real detections needed on
+    # each side of the ball's low point at 120fps (scaled to the camera's
+    # frame rate by set_frame_rate, min 3), how many standard errors the drop
+    # and rise slopes must clear, the smallest sudden slowdown that counts as
+    # a kink, and how far outside the calibrated court (ft) a landing may map
+    # before it's the ball high in the air. Tuned on a simulated 120fps
+    # session (12 landings incl. six within 0.5ft of a line, 1.5px jitter, 8%
+    # missed detections, 2px calibration click error; 10 runs): 113/120
+    # landings called right with 1 false call from the side of the court,
+    # 102/120 with none from behind a baseline. The old detector: 22/60 right
+    # and 694 false calls over 5 runs from behind a baseline.
+    BOUNCE_SIDE_POINTS = 8
+    BOUNCE_MIN_T = 2.5
+    KINK_MIN_SLOWDOWN = 2.5  # px/frame at 120fps, see _detect_ball_contact
+    LANDING_MARGIN_FT = 10.0
 
     def __init__(
         self,
@@ -852,9 +1017,6 @@ class PickleVisionTracker:
         # The latest line call, for run_video's on-screen banner and terminal
         # log: {"call", "court" (x, y ft), "frame_index", "time", "new"}.
         self.last_call = None
-        # False when running on the default full-frame CourtMapper above,
-        # whose "court" is just the whole image.
-        self.court_calibrated = court_mapper is not None
         self.target_fps = target_fps
         self.target_width = target_width
         self.target_height = target_height
@@ -862,6 +1024,9 @@ class PickleVisionTracker:
         # Prepended to this tracker's console messages -- DualCameraTracker
         # sets it per camera, so each line says which camera it's about.
         self.log_prefix = ""
+        # See _plausible_landing: with a half-court calibration, ignore
+        # landings past the net. DualCameraTracker turns it off.
+        self.half_court_only = True
 
         # "Digital zoom": crop detection/display to the calibrated court region so
         # the same imgsz budget is spent entirely on the area that matters, instead
@@ -898,8 +1063,30 @@ class PickleVisionTracker:
         self._lock_origin: tuple[float, float] | None = None
         self._lock_has_moved = False
         # Raw (unsmoothed) real detections of the current lock as
-        # (frame_index, x, y) -- the input to _fit_motion.
-        self._observations: list[tuple[int, float, float]] = []
+        # (frame_index, x, y, box half-height) -- the input to _fit_motion and
+        # _detect_ball_contact.
+        self._observations: list[tuple[int, float, float, float]] = []
+        # The ball's radius in the image (its latest box's half-height).
+        self._ball_radius_px = 0.0
+        # Frame of the last low point reported as a bounce, per track, so
+        # each bounce is reported once (see _detect_ball_contact).
+        self._last_bounce_frames: dict = {}
+        self.last_landing_frame: int | None = None
+        # Frame-rate dependent settings -- see set_frame_rate.
+        self.frame_rate = 120
+        self.bounce_side_points = self.BOUNCE_SIDE_POINTS
+        self.kink_min_slowdown = self.KINK_MIN_SLOWDOWN
+        self.person_refresh_frames = 1
+        # Live sources: when the last processed frames arrived (see track_processing_rate).
+        self._processed_at: deque = deque()
+        self._rate_checked_at = 0.0
+        self._rate_started_at: float | None = None
+        self._person_boxes: list = []
+        self._person_boxes_frame: int | None = None
+        # Live sources run the person filter on a worker thread (see _detect_people).
+        self.async_person_filter = False
+        self._person_worker = None
+        self._person_pending = None
 
         # Internal bookkeeping IDs (primary_track_id) can legitimately change
         # every single frame for the Roboflow backend -- IDs are deliberately
@@ -956,43 +1143,176 @@ class PickleVisionTracker:
         distance = np.hypot(dx, dy)
         return float(distance)
 
-    def _detect_ball_contact(self, track_points):
-        """Detects a bounce by looking for a V-shape change in the Y-axis.
-        
-        Physics: A true court bounce is defined by the ball moving downward (increasing Y)
-        then suddenly moving upward (decreasing Y). X-axis changes are ignored because they
-        represent spin, curvature, or lateral movement, not bounces.
+    def _detect_ball_contact(self, points, frames, key="primary", radii=None):
+        """Detects a bounce by looking for a V-shape in the Y-axis -- or a kink.
+
+        Physics: A true court bounce is the ball moving downward (increasing Y)
+        then suddenly moving upward (decreasing Y). The top of an arc is the
+        opposite shape (up, then down) and never a landing. A ball coming
+        toward the camera can keep moving down the image through its bounce,
+        just abruptly slower: that kink counts too (see below). X-axis changes
+        don't make a bounce -- they're spin, curvature, lateral movement --
+        but the ball being sent back the way it came does unmake one: only a
+        paddle does that.
+
+        `points` are REAL detections (raw, unsmoothed -- smoothing and
+        prediction would round off the V) with their frame indices, and
+        `radii` their boxes' half-heights (to put the landing at the ball's
+        bottom). The
+        ball's lowest point in the image must sit exactly bounce_side_points
+        detections before the newest, with the ball at least bounce_min_dy px
+        higher at both ends of that window, and lines fitted to the drop and
+        the rise must both slope clearly beyond the jitter they leave
+        (BOUNCE_MIN_T times their standard error). Measured across several
+        frames rather than frame to frame, detector jitter (a pixel or two
+        per frame) can't fake a V -- not even on a ball held still before a
+        serve, the commonest false bounce without that slope test -- yet a
+        far-off ball moving a pixel or two per frame at 120fps still
+        registers. Each low point is reported once.
+
+        This replaces a frame-to-frame direction-change check plus a "speed
+        drop" fallback. On a simulated 120fps session (1.5px jitter, 8%
+        missed detections) those raised ~11 false calls per real landing: any
+        direction change counted, including every top of an arc, and a ball
+        whose speed merely dipped under 4px/frame -- routine for a far-off
+        ball at 120fps -- counted as a bounce.
+
+        Returns the landing point -- where lines fitted to the drop and the
+        rise cross, a sub-frame estimate of the moment of contact that's
+        steadier than any single detection -- or None.
         """
-        if len(track_points) < 5:
+        side = self.bounce_side_points
+        if len(points) < 2 * side + 1:
             return None
+        pts = np.asarray(points[-(2 * side + 1):], dtype=float)
+        fr = np.asarray(frames[-(2 * side + 1):], dtype=float)
+        ys = pts[:, 1]
+        # Detections spread over a long gap could span a hit as well as a bounce.
+        if fr[-1] - fr[0] > 6 * side:
+            return None
+        # A bounce changes the ball's velocity, never its position: a jump
+        # within the window is the lock hopping between objects (or a new
+        # ball put in play), which the fits below would read as a huge kink.
+        steps = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1])) / np.maximum(np.diff(fr), 1)
+        if steps.max() > max(4 * float(np.median(steps)), 10.0):
+            return None
+        t = fr - fr[side]
+        try:
+            fall, rise, standard_error = self._split_fit(t, ys, side, noise_floor=0.5)
+            x_in, x_out, x_error = self._split_fit(t, pts[:, 0], side, noise_floor=0.5)
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+        # The ground can't turn the ball back the way it came; a paddle can.
+        # Seen from the side of the court, where play runs across the image,
+        # this is what tells most hits apart from bounces. Slopes, not single
+        # points: on a ball dropping straight down, two jittery points alone
+        # "reversed" often enough to throw away real bounces. And it must be a
+        # fast turn-back: perspective alone swings an off-center ball's image
+        # sideways and back at a straight-down bounce (its distance to the
+        # camera turns back), but only by a fraction of its vertical speed --
+        # a paddle sends it back the way it came at full speed.
+        turn_back = min(abs(x_in[0]), abs(x_out[0]))
+        if x_in[0] * x_out[0] < 0 and turn_back >= max(self.BOUNCE_MIN_T * x_error, 0.5 * min(abs(fall[0]), abs(rise[0]))):
+            return None
+        min_slope = self.BOUNCE_MIN_T * standard_error
+        v_shape = int(np.argmax(ys)) == side and min(ys[side] - ys[0], ys[side] - ys[-1]) >= self.bounce_min_dy
+        if v_shape:
+            if fall[0] < min_slope or -rise[0] < min_slope:
+                return None
+        else:
+            # A kink instead of a V: coming toward the camera, a ball keeps
+            # moving down the image straight through its bounce, just
+            # abruptly slower -- the ground's upward kick against its
+            # approach. Gravity and perspective only ever bend the path the
+            # other way, so a big enough, sudden enough slowdown centered here
+            # is the bounce. (The V test alone missed every such bounce in
+            # simulation: from behind a baseline, most of the shots coming
+            # back.) It must be coming DOWN the image into it: counting upward
+            # kicks of a ball already moving up too caught flat drives racing
+            # away, but also 10-20x more paddle hits as false bounces.
+            if fall[0] < min_slope:
+                return None
+            slowdown = fall[0] - rise[0]
+            if slowdown < max(self.BOUNCE_MIN_T * np.sqrt(2) * standard_error, self.kink_min_slowdown):
+                return None
+            # The kink must be at (within a frame of) this window's middle --
+            # not tighter, or with jitter the estimate can step right over a
+            # half-frame window as it slides. Repeats are dropped below.
+            if abs((rise[1] - fall[1]) / slowdown) > 1.0:
+                return None
+        low_frame = int(fr[side])
+        # One bounce can pass both tests a frame apart; two real ones can't
+        # be that close together.
+        if low_frame <= self._last_bounce_frames.get(key, -1) + side:
+            return None
+        self._last_bounce_frames[key] = low_frame
+        self.last_landing_frame = low_frame
+        landing_x, landing_y = self._fit_landing(pts, t, fall, rise)
+        if radii is not None:
+            # The ball touches the ground at its bottom, not its center: a
+            # ball's radius (~1.5in) further down the image. Mapping the center
+            # put landings 3-6in too far from the camera, always the same way
+            # -- the largest single error in simulation, and a biased one.
+            landing_y += float(np.median(radii[-(2 * side + 1):]))
+        return landing_x, landing_y
 
-        recent = track_points[-5:]
-        y_vals = [p[1] for p in recent]
+    @staticmethod
+    def _split_fit(t, values, side, noise_floor):
+        """Lines fitted to `values` up to and from the middle point (index
+        `side`), and the standard error of their slopes -- from the jitter
+        the lines leave unexplained, never taken as less than noise_floor."""
+        before = np.polyfit(t[: side + 1], values[: side + 1], 1)
+        after = np.polyfit(t[side:], values[side:], 1)
+        residuals = np.concatenate([values[: side + 1] - np.polyval(before, t[: side + 1]), values[side:] - np.polyval(after, t[side:])])
+        jitter = max(float(np.sqrt(np.sum(residuals**2) / max(len(residuals) - 4, 1))), noise_floor)
+        spread = min(float(np.std(t[: side + 1])), float(np.std(t[side:]))) * np.sqrt(side + 1)
+        return before, after, (jitter / spread if spread > 0 else np.inf)
 
-        # Calculate the change in Y (dy)
-        dy = np.diff(y_vals)
+    @staticmethod
+    def _fit_landing(pts, t, fall, rise):
+        """Where the lines fitted to the drop and the rise cross: the moment
+        of contact, between frames. `t` is each point's frame offset from the
+        low point."""
+        side = int(np.argmin(np.abs(t)))
+        low = (float(pts[side, 0]), float(pts[side, 1]))
+        if fall[0] - rise[0] <= 1e-6:
+            return low
+        contact = (rise[1] - fall[1]) / (fall[0] - rise[0])
+        if not t[0] <= contact <= t[-1]:
+            return low
+        along_x = np.polyfit(t, pts[:, 0], 1)
+        return float(np.polyval(along_x, contact)), float(np.polyval(fall, contact))
 
-        # If the ball was going down (+dy) and suddenly goes up (-dy), it bounced.
-        # Steps smaller than bounce_min_dy are detector jitter, not movement, so
-        # they're dropped before comparing directions.
-        signs = np.sign(dy[np.abs(dy) >= self.bounce_min_dy])
-        direction_change_y = np.any(signs[:-1] != signs[1:])
+    def _plausible_landing(self, point):
+        """False for a "landing" mapping more than LANDING_MARGIN_FT outside
+        the calibrated court: a V the ball made high in the air (e.g. a lob
+        dropping onto a paddle), whose line of sight meets the ground far
+        away. Always True uncalibrated, where there's no court to compare.
 
-        # Speed drop is a fallback for when a ball rolls or loses momentum near the boundary.
-        # Only the moment it slows counts -- a ball that's simply stationary (held,
-        # resting) would otherwise register as a new "bounce" on every frame.
-        speed_drop = self._estimate_velocity(recent) < 4.0 <= self._estimate_velocity(recent[:-1])
-
-        if direction_change_y or speed_drop:
-            return recent[-1]
-
-        return None
+        With a half-court calibration (an end camera, net = the TOP edge) a
+        single camera also doesn't call anything past the net: that half isn't
+        its to call, and a ball in the air above it maps farther still. On real
+        footage (ELP behind a baseline, near half calibrated) most wrong OUT
+        calls were exactly this -- "-8 to -134 ft from the net". Dual-camera
+        mode clears half_court_only: the other end camera covers that half.
+        """
+        if not self.court_calibrated:
+            return True
+        x, y = self.court_mapper.map_point(self.frame_coords(point))
+        dst = self.court_mapper.dst_points
+        margin = self.LANDING_MARGIN_FT
+        y_min = float(np.min(dst[:, 1]))
+        half_court = self.court_mapper.view == "end" and abs(self.court_mapper.court_length - 44.0) >= 1.0
+        if half_court and self.half_court_only and y < y_min:
+            return False
+        return (
+            float(np.min(dst[:, 0])) - margin <= x <= float(np.max(dst[:, 0])) + margin
+            and y_min - margin <= y <= float(np.max(dst[:, 1])) + margin
+        )
 
     def _court_position(self, point):
         """A point in the frame process_frame works on -> court (x, y) in ft."""
-        if self.zoom_roi is not None:
-            point = (point[0] + self.zoom_roi[0], point[1] + self.zoom_roi[1])
-        return self.court_mapper.map_point(point)
+        return self.court_mapper.map_point(self.frame_coords(point))
 
     def _draw_court_and_call(self, frame):
         """run_video's single-camera overlay: the calibrated court's lines (bent
@@ -1013,11 +1333,17 @@ class PickleVisionTracker:
             return
         color = (0, 200, 0) if call["call"] == "IN" else (0, 0, 255)
         x_ft, y_ft = call["court"]
-        from_edge = "the net" if abs(self.court_mapper.court_length - 44.0) >= 1.0 else "the far baseline"
+        if self.court_mapper.view == "side":
+            # --view side's court coordinates: x=0 is the near sideline, y=0
+            # the baseline at the right of the image.
+            where = f"{x_ft:.1f} ft from the near sideline, {y_ft:.1f} ft from the right-hand baseline"
+        else:
+            from_edge = "the net" if abs(self.court_mapper.court_length - 44.0) >= 1.0 else "the far baseline"
+            where = f"{x_ft:.1f} ft from the left sideline, {y_ft:.1f} ft from {from_edge}"
         _draw_label(frame, call["call"], (frame.shape[1] // 2 - 40, 60), color, scale=1.8, thickness=4)
         _draw_label(
             frame,
-            f"{x_ft:.1f} ft from the left sideline, {y_ft:.1f} ft from {from_edge}",
+            where,
             (frame.shape[1] // 2 - 200, 95),
             color,
             scale=0.55,
@@ -1046,12 +1372,52 @@ class PickleVisionTracker:
         return (point[0] + offset_x, point[1] + offset_y)
 
     def ball_position(self):
-        """The locked ball's position this frame, in original-frame pixels,
-        and whether it's a real detection (False = bridged by prediction
-        through a detection gap). None when no ball is locked."""
+        """The locked ball's position this frame, in original-frame pixels --
+        its bottom, the point that touches the ground when it bounces -- and
+        whether it's a real detection (False = bridged by prediction through
+        a detection gap). None when no ball is locked."""
         if not self.primary_trajectory:
             return None
-        return self.frame_coords(self.primary_trajectory[-1]), self.missed_frames == 0
+        x, y = self.primary_trajectory[-1]
+        return self.frame_coords((x, y + self._ball_radius_px)), self.missed_frames == 0
+
+    def set_frame_rate(self, fps):
+        """Scale the frame-count settings to the source's frame rate: the
+        bounce detector's window (BOUNCE_SIDE_POINTS is for 120fps; a 30fps
+        camera would otherwise need 8 frames = 267 ms after every bounce), and
+        how often the person filter re-runs (~30 times a second)."""
+        fps = fps or 30
+        self.frame_rate = fps
+        self.bounce_side_points = max(3, round(self.BOUNCE_SIDE_POINTS * fps / 120))
+        self.kink_min_slowdown = self.KINK_MIN_SLOWDOWN * 120 / fps  # px per frame grows as frames get further apart
+        self.person_refresh_frames = max(1, round(fps / 30))
+
+    def track_processing_rate(self, now, camera_fps):
+        """Live sources: time the frame-count settings (set_frame_rate) to
+        the frames actually processed, not the camera's rate. A live camera's
+        newest frame is taken each step and the rest dropped, so when
+        processing can't keep up -- two 120fps cameras on one laptop GPU run
+        ~60 pairs/s -- the detector sees every 2nd frame, and its 8-frame
+        bounce window at "120fps" really spans twice as long. In simulation
+        at 60 processed fps: 89/120 landings right timed for 120, 98 timed
+        for 60; at 40: 70 vs 93. Re-checked twice a second from the last
+        second's frames; re-timed on a change of more than 10%. The first
+        1.5 s are skipped: startup (window, first GPU calls) runs slow.
+        """
+        times = self._processed_at
+        if self._rate_started_at is None:
+            self._rate_started_at = now
+        times.append(now)
+        while now - times[0] > 1.0:
+            times.popleft()
+        if now - self._rate_started_at < 1.5 or now - self._rate_checked_at < 0.5 or len(times) < 10:
+            return
+        self._rate_checked_at = now
+        rate = min(float(camera_fps), (len(times) - 1) / (times[-1] - times[0]))
+        if abs(rate - self.frame_rate) > 0.1 * self.frame_rate:
+            if self.frame_rate == camera_fps or abs(rate - self.frame_rate) > 0.25 * self.frame_rate:
+                print(f"{self.log_prefix}[Rate] Processing {rate:.0f} of the camera's {camera_fps} frames/s -- bounce detection timed for {rate:.0f}")
+            self.set_frame_rate(round(rate))
 
     def _compute_zoom_roi(self, frame_width, frame_height):
         """Bounding box (with padding) around the calibrated court corners, in
@@ -1095,9 +1461,38 @@ class PickleVisionTracker:
         (or drifting motion-blur predictions) that land on a person -- clothing
         color/shape alone can't tell a player wearing ball-colored gear apart
         from the real ball.
+
+        Boxes are reused for person_refresh_frames frames (~1/30 s, see
+        set_frame_rate): people barely move in that time, and running the
+        detector on every frame (~9 ms on an RTX 4050 Laptop) is what held
+        processing below a 120fps camera's frame rate.
+
+        With async_person_filter (live sources) the refresh runs on a worker
+        thread and this returns the latest finished boxes without waiting --
+        one refresh (~1/30 s) older, which people don't notice either. In
+        dual-camera mode it was ~5 ms of every pair's critical path. Video
+        files keep it synchronous, so re-running one gives the same result.
         """
         if self.person_model is None:
             return []
+        pending = self._person_pending
+        if pending is not None and pending.done():
+            self._person_boxes, self._person_pending = pending.result(), None
+        if self._person_boxes_frame is not None and self.frame_index - self._person_boxes_frame < self.person_refresh_frames:
+            return self._person_boxes
+        self._person_boxes_frame = self.frame_index
+        if not self.async_person_filter:
+            self._person_boxes = self._find_people(frame)
+        elif self._person_pending is None:
+            if self._person_worker is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._person_worker = ThreadPoolExecutor(max_workers=1)
+            # A copy: the caller goes on to draw on this frame.
+            self._person_pending = self._person_worker.submit(self._find_people, frame.copy())
+        return self._person_boxes
+
+    def _find_people(self, frame):
         results = self.person_model.predict(frame, classes=[0], conf=0.3, verbose=False)
         if not results or results[0].boxes is None or len(results[0].boxes) == 0:
             return []
@@ -1300,7 +1695,7 @@ class PickleVisionTracker:
         obs = self._observations[-self.PREDICT_FIT_POINTS:]
         if len(obs) < self.PREDICT_MIN_POINTS:
             return None
-        t, xs, ys = (np.array(v, dtype=float) for v in zip(*obs))
+        t, xs, ys = (np.array(v, dtype=float) for v in list(zip(*obs))[:3])
 
         dy = np.diff(ys)
         moving = np.nonzero(np.abs(dy) >= self.bounce_min_dy)[0]
@@ -1410,16 +1805,25 @@ class PickleVisionTracker:
             travelled = np.hypot(center_x - self._lock_origin[0], center_y - self._lock_origin[1])
             self._lock_has_moved = travelled > 2 * self.STATIC_KEEP_RADIUS_PX
         if not predicted:
-            self._observations.append((self.frame_index, raw_x, raw_y))
-            del self._observations[: -self.PREDICT_FIT_POINTS]
+            self._observations.append((self.frame_index, raw_x, raw_y, (y2 - y1) / 2.0))
+            self._ball_radius_px = (y2 - y1) / 2.0
+            del self._observations[: -max(self.PREDICT_FIT_POINTS, 2 * self.bounce_side_points + 1)]
 
         self.primary_trajectory.append((center_x, center_y))
         if len(self.primary_trajectory) > self.max_history:
             self.primary_trajectory.pop(0)
 
         velocity = self._estimate_velocity(self.primary_trajectory)
-        landing_point = self._detect_ball_contact(self.primary_trajectory)
-        if landing_point is not None and not predicted:
+        landing_point = None
+        if not predicted:
+            landing_point = self._detect_ball_contact(
+                [(o[1], o[2]) for o in self._observations],
+                [o[0] for o in self._observations],
+                radii=[o[3] for o in self._observations],
+            )
+            if landing_point is not None and not self._plausible_landing(landing_point):
+                landing_point = None
+        if landing_point is not None:
             call = self._classify_in_out(landing_point)
             self.events.append(
                 BallEvent(
@@ -1428,6 +1832,7 @@ class PickleVisionTracker:
                     centroid=(center_x, center_y),
                     velocity=velocity,
                     landing_point=landing_point,
+                    landing_frame=self.last_landing_frame,
                     line_call=call,
                     camera_id=self.camera_id,
                 )
@@ -1485,7 +1890,11 @@ class PickleVisionTracker:
                 track.pop(0)
 
             velocity = self._estimate_velocity(track)
-            landing_point = self._detect_ball_contact(track)
+            # One centroid per frame this track was seen in.
+            frames = list(range(self.frame_index - len(track) + 1, self.frame_index + 1))
+            landing_point = self._detect_ball_contact(track, frames, key=track_id)
+            if landing_point is not None and not self._plausible_landing(landing_point):
+                landing_point = None
             if landing_point is not None:
                 call = self._classify_in_out(landing_point)
                 self.events.append(
@@ -1495,6 +1904,7 @@ class PickleVisionTracker:
                         centroid=(center_x, center_y),
                         velocity=velocity,
                         landing_point=landing_point,
+                        landing_frame=self.last_landing_frame,
                         line_call=call,
                         camera_id=self.camera_id,
                     )
@@ -1793,6 +2203,12 @@ class PickleVisionTracker:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         print(f"[Camera Actual] {width}x{height} @ {fps}fps")
+        times = None if isinstance(video_source, int) else _load_timestamps(video_source)
+        delivered = _delivered_fps(times) if times is not None else None
+        if delivered and abs(delivered - fps) > 0.1 * fps:
+            print(f"[Camera Actual] ...but it really delivered {delivered}fps when recorded (from its capture times)")
+            fps = delivered
+        self.set_frame_rate(fps)
 
         # Recording writes video-encode (CPU) work on top of detection work -- a
         # high capture fps (120) is valuable for detection/motion-blur, but
@@ -1872,9 +2288,10 @@ class PickleVisionTracker:
 
         stats = _SessionStats(stats_csv) if stats_csv else None
         reader = _FrameReader(cap, live=isinstance(video_source, int))
+        self.async_person_filter = reader.live
         try:
             while True:
-                frame, arrived_at = reader.read()
+                frame, arrived_at, _ = reader.read()
                 if frame is None:
                     break
 
@@ -1888,6 +2305,8 @@ class PickleVisionTracker:
                 raw_frame = frame.copy() if raw_writer is not None else None
 
                 annotated = self.process_frame(frame)
+                if reader.live:
+                    self.track_processing_rate(arrived_at, fps)
                 if stats is not None:
                     stats.frame_done(arrived_at)
                 self._draw_court_and_call(annotated)
@@ -1988,6 +2407,10 @@ class DualCameraFusion:
     # Whether the ball has been in the air since the last bounce is only
     # known while both cameras see it; after this long without, it's unknown.
     AIRBORNE_MEMORY_S = 0.5
+    # Roughly how far behind its baseline each end camera stands (ft) --
+    # only used to weight the two cameras' readings (see _ground_point), so
+    # being a few feet off barely matters.
+    CAMERA_SETBACK_FT = 15.0
 
     def __init__(self, court_width=20.0, half_length=22.0, agreement_ft=3.0):
         self.court_width = court_width
@@ -2048,13 +2471,33 @@ class DualCameraFusion:
             return
         (_, _, before, _, _), (t_low, frame_low, low, low_a, low_b), (_, _, after, _, _) = self._gaps
         if low < before and low <= after and low <= self.agreement_ft:
-            midpoint = ((low_a[0] + low_b[0]) / 2, (low_a[1] + low_b[1]) / 2)
-            camera = self.home_camera(midpoint)
+            point = self._ground_point(low_a, low_b)
+            camera = self.home_camera(point)
             self._add({
-                "camera": camera, "source": "ground", "point": low_a if camera == "A" else low_b,
+                "camera": camera, "source": "ground", "point": point,
                 "status": "CONFIRMED", "gap": low, "t": t_low, "frame_index": frame_low,
             })
             self._airborne = False
+
+    def _ground_point(self, point_a, point_b):
+        """The landing spot from both cameras' readings at the ground check's
+        low point. That sample is the frame closest to contact, but rarely
+        at it: the ball is still up to a frame's fall above the ground, and
+        each camera maps a raised ball away from itself along its line of
+        sight -- ~7 ft per ft of height -- so the two readings straddle the
+        true spot. It sits closer to the nearer camera's reading, in
+        proportion to the two cameras' distances. In simulation (a dink
+        landing 3 ft past the net, cameras at 120fps + 60fps) the home
+        camera's reading alone was 1.1-1.4 ft off; this cancels most of it.
+        """
+        y = (point_a[1] + point_b[1]) / 2
+        distance_a = max(1.0, y + self.CAMERA_SETBACK_FT)
+        distance_b = max(1.0, 2 * self.half_length - y + self.CAMERA_SETBACK_FT)
+        weight_a = distance_b / (distance_a + distance_b)
+        return (
+            weight_a * point_a[0] + (1 - weight_a) * point_b[0],
+            weight_a * point_a[1] + (1 - weight_a) * point_b[1],
+        )
 
     def add_flag(self, camera, court_point, other_camera_point, t, frame_index):
         """A bounce flagged by `camera`'s own _detect_ball_contact at
@@ -2152,6 +2595,122 @@ class DualCameraFusion:
         )
 
 
+class CaptureTimeAligner:
+    """Feeds DualCameraFusion in capture-time order, pairing each camera's
+    ball position with where the OTHER camera saw the ball at that same
+    instant -- interpolated between that camera's frames just before and
+    after it.
+
+    The fusion's ground check compares two cameras' court positions for the
+    ball, and a ball in flight moves ~0.5 ft per 120fps frame: positions
+    even a few ms apart differ by more than the calibrations do. Frames
+    processed together aren't captured together -- the cameras aren't
+    synchronized, one can run slower (dim light) or be skipped a step, and
+    each driver hands its frames over 80-270 ms after capture, varying frame
+    to frame (a laptop webcam, measured) -- so pairing by processing step
+    compares the ball at two different moments. Each sample waits here
+    until the other camera has a frame after it (a frame period or so), then
+    goes to the fusion.
+
+    A bounce flag is paired the same way, at its landing frame's capture
+    time: it's raised a few frames after the landing (the detector needs the
+    rise too), when the other camera's current view shows the ball already
+    back up in the air.
+    """
+
+    # Interpolate only across a gap this short in the other camera's frames
+    # (~8 frames at 120fps): longer, and the ball's path between isn't a line.
+    MAX_BRACKET_S = 0.07
+    # A camera whose newest frame is this far behind the other's is stalled
+    # or unplugged: samples stop waiting for it.
+    STALE_S = 0.3
+    HISTORY_S = 2.0
+
+    def __init__(self, fusion):
+        self.fusion = fusion
+        # Per camera, every processed frame as (capture time, court point of
+        # a real detection, or None), in time order.
+        self.history: dict[str, list] = {"A": [], "B": []}
+        # Each camera's frame_index -> capture time, for its bounce flags' landing frames.
+        self.frame_times: dict[str, dict[int, float]] = {"A": {}, "B": {}}
+        self._pending: list = []
+        self._order = 0
+        self.emitted_until = float("-inf")
+
+    def add_frame(self, end, frame_index, t, court_point):
+        """One processed frame of camera `end`, captured at t: its court
+        point for the ball (a real detection), or None."""
+        history = self.history[end]
+        if history and t <= history[-1][0]:
+            return  # a repeated or out-of-order capture time: nothing new
+        history.append((t, court_point))
+        while history and history[0][0] < t - self.HISTORY_S:
+            history.pop(0)
+        times = self.frame_times[end]
+        times[frame_index] = t
+        for old in [index for index in times if index < frame_index - 1000]:
+            del times[old]
+        self._push(t, 0, end, court_point, frame_index)
+
+    def add_flag(self, end, landing_frame, court_point, fallback_t):
+        """A bounce flag from camera `end`'s own detector, landing in its
+        frame landing_frame at court_point (global ft)."""
+        t = self.frame_times[end].get(landing_frame, fallback_t)
+        self._push(t, 1, end, court_point, landing_frame)
+
+    def _push(self, t, kind, end, court_point, frame_index):
+        import heapq
+
+        # Samples before flags at the same instant: the fusion expects the
+        # ball's latest state before a flag (see add_ground_sample).
+        heapq.heappush(self._pending, (t, kind, self._order, end, court_point, frame_index))
+        self._order += 1
+
+    def _other_at(self, end, t, force):
+        """(ready, court point): the other camera's ball at time t, or None
+        if it had no real detection around then. ready is False while that
+        camera has no frame at or after t yet."""
+        history = self.history["B" if end == "A" else "A"]
+        newest = max((h[-1][0] for h in self.history.values() if h), default=t)
+        if not history or history[-1][0] < t:
+            stalled = not history or history[-1][0] < newest - self.STALE_S
+            return (force or stalled), None
+        if t < history[0][0]:
+            return True, None
+        after = next(i for i, (frame_t, _) in enumerate(history) if frame_t >= t)
+        t1, p1 = history[after]
+        if t1 - t < 1e-4:
+            return True, p1
+        t0, p0 = history[after - 1]
+        if p0 is None or p1 is None or t1 - t0 > self.MAX_BRACKET_S:
+            return True, None
+        w = (t - t0) / (t1 - t0)
+        return True, (p0[0] + w * (p1[0] - p0[0]), p0[1] + w * (p1[1] - p0[1]))
+
+    def flush(self, force=False):
+        """Hand the fusion everything that can be paired now (force: all of
+        it, at the end of a session). Returns the time up to which the
+        fusion has been fed."""
+        import heapq
+
+        while self._pending:
+            t, kind, _, end, court_point, frame_index = self._pending[0]
+            ready, other = self._other_at(end, t, force)
+            if not ready:
+                break
+            heapq.heappop(self._pending)
+            self.emitted_until = max(self.emitted_until, t)
+            if kind == 0:
+                if court_point is None:
+                    self.fusion.add_ground_sample(t, frame_index, None, None)
+                else:
+                    a, b = (court_point, other) if end == "A" else (other, court_point)
+                    self.fusion.add_ground_sample(t, frame_index, a, b)
+            else:
+                self.fusion.add_flag(end, court_point, other, t, frame_index)
+        return self.emitted_until
+
+
 class DualCameraTracker:
     """Tracks with both end cameras at once -- CLAUDE.md's dual end-camera
     build. Each camera gets its own PickleVisionTracker (its own ball lock,
@@ -2160,18 +2719,22 @@ class DualCameraTracker:
     full-court coordinate system (to_global_court_point) and the flags are
     fused into line calls (DualCameraFusion).
 
-    Frames are taken in lockstep, one from each camera per step. From video
-    files that pairs frame N with frame N; from live cameras it's each one's
-    newest frame -- their clocks aren't synced, so a pair can be up to one
-    frame period apart (~8ms at 120fps). Each step runs the two trackers on
+    Frames are taken in time order (_SyncedFrames): live, each camera's
+    newest frame -- their clocks aren't synced, so the two can be up to one
+    frame period apart (~8ms at 120fps); from video files, by the capture
+    times --record-raw saved beside them. Each step runs the two trackers on
     two threads, so one camera's CPU work (filtering, drawing) overlaps the
-    other's GPU work: benchmarked on an RTX 4050 Laptop with rendered 720p
-    footage and GPU torch, 70.5 -> 81.6 pairs/s with the person filter off,
-    38.5 with it on (the default).
+    other's GPU work. The detection model is shared, and the GPU is the
+    limit: two 120fps cameras on an RTX 4050 Laptop (720p, person filter on)
+    run ~90 pairs/s live -- so the detector sees ~3 of every 4 frames and is
+    timed for that (track_processing_rate).
     """
 
     PANEL_HEIGHT = 360
     COURT_VIEW_HEIGHT = 300
+    # The combined view is only built this often unless it's being recorded:
+    # ~3 ms a pair, and the window doesn't need more.
+    DISPLAY_FPS = 30
     CAMERA_COLORS = {"A": (255, 170, 0), "B": (0, 150, 255)}  # BGR: blue, orange
     RECENT_CALLS_SHOWN = 12
 
@@ -2179,12 +2742,14 @@ class DualCameraTracker:
         self.trackers = {"A": tracker_a, "B": tracker_b}
         for end, tracker in self.trackers.items():
             tracker.log_prefix = f"[Cam {end}] "
+            tracker.half_court_only = False
         self.court_width = court_width
         self.half_length = half_length
         # Court positions need both cameras calibrated -- an uncalibrated
         # tracker's "court" is just its whole frame.
         self.calibrated = tracker_a.court_calibrated and tracker_b.court_calibrated
         self.fusion = DualCameraFusion(court_width, half_length, agreement_ft)
+        self.aligner = CaptureTimeAligner(self.fusion)
         self.pair_index = 0
         self._events_seen = {"A": 0, "B": 0}
 
@@ -2193,29 +2758,33 @@ class DualCameraTracker:
         local = self.trackers[end].court_mapper.map_point(frame_point)
         return to_global_court_point(local, end, self.half_length, self.court_width)
 
-    def _update(self, t):
-        """After both cameras' step: hand any new bounce flags to the fusion.
-        Returns each camera's ball as (court point, is a real detection), or
-        None, for the court view."""
+    def _update(self, captured):
+        """After a step: hand the fusion (through the aligner) each processed
+        camera's ball and any new bounce flags. captured maps each camera
+        processed this step to its frame's capture time. Returns each
+        camera's ball as (court point, is a real detection), or None, for
+        the court view."""
         balls = {}
         for end, tracker in self.trackers.items():
             state = tracker.ball_position()
             balls[end] = None if state is None or not self.calibrated else (self._court_point(end, state[0]), state[1])
-        # Only real detections count as a camera seeing the ball -- a
-        # prediction bridging a gap is a guess, not evidence.
-        detected = {end: ball[0] if ball is not None and ball[1] else None for end, ball in balls.items()}
-        if self.calibrated:
-            self.fusion.add_ground_sample(t, self.pair_index, detected["A"], detected["B"])
-        for end, tracker in self.trackers.items():
+        for end, t in captured.items():
+            tracker = self.trackers[end]
             new_events = tracker.events[self._events_seen[end]:]
             self._events_seen[end] = len(tracker.events)
             if not self.calibrated:
                 continue
+            # Only real detections count as a camera seeing the ball -- a
+            # prediction bridging a gap is a guess, not evidence.
+            ball = balls[end]
+            self.aligner.add_frame(end, tracker.frame_index, t, ball[0] if ball is not None and ball[1] else None)
             for event in new_events:
                 court_point = self._court_point(end, tracker.frame_coords(event.landing_point))
-                self.fusion.add_flag(end, court_point, detected["B" if end == "A" else "A"], t, self.pair_index)
-        for call in self.fusion.close_ready(t):
-            self._print_call(call)
+                landing_frame = event.landing_frame if event.landing_frame is not None else event.frame_index
+                self.aligner.add_flag(end, landing_frame, court_point, t)
+        if self.calibrated:
+            for call in self.fusion.close_ready(self.aligner.flush()):
+                self._print_call(call)
         return balls
 
     @staticmethod
@@ -2318,18 +2887,20 @@ class DualCameraTracker:
         """Track both cameras until either source ends (or fails) or 'q' is
         pressed in the window. Returns the line calls.
 
+        Frames are taken in time order (_SyncedFrames): each step processes
+        the cameras with a new frame -- both, normally, on two threads.
         output_path records the combined view (both feeds + court diagram).
         raw_output_a/raw_output_b record each camera's unannotated frames,
-        written in step, so the pair replays in sync as --source/--source2
-        video files. flips maps "A"/"B" to (horizontal, vertical).
+        written in step (for lag-free footage to replay, use --record-raw).
+        flips maps "A"/"B" to (horizontal, vertical).
         """
         from concurrent.futures import ThreadPoolExecutor
 
         if str(source_a) == str(source_b):
             raise ValueError(f"--source and --source2 are the same ({source_a}) -- dual-camera mode needs two different cameras or videos")
         flips = flips or {}
-        caps, live, readers, writers = {}, {}, {}, {}
-        display = stats = None
+        caps, live, writers, camera_fps, timestamps = {}, {}, {}, {}, {}
+        frames_in = display = stats = None
         executor = ThreadPoolExecutor(max_workers=1)
         t = 0.0
         try:
@@ -2337,11 +2908,24 @@ class DualCameraTracker:
                 tracker = self.trackers[end]
                 caps[end], live[end] = _open_video_source(source, tracker.target_width, tracker.target_height, tracker.target_fps)
                 cap = caps[end]
+                camera_fps[end] = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+                timestamps[end] = None if live[end] else _load_timestamps(source)
+                delivered = _delivered_fps(timestamps[end]) if timestamps[end] is not None else None
+                note = ""
+                if delivered and abs(delivered - camera_fps[end]) > 0.1 * camera_fps[end]:
+                    note = f" (really delivered {delivered}fps, from its capture times)"
+                    camera_fps[end] = delivered
+                elif timestamps[end] is not None:
+                    note = " (synced by its capture times)"
+                tracker.set_frame_rate(camera_fps[end])
                 print(
                     f"[Camera {end}] {source}: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-                    f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {int(cap.get(cv2.CAP_PROP_FPS)) or 30}fps"
+                    f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {int(cap.get(cv2.CAP_PROP_FPS)) or 30}fps{note}"
                 )
-            fps = min(int(cap.get(cv2.CAP_PROP_FPS)) or 30 for cap in caps.values())
+            if not any(live.values()) and (timestamps["A"] is None) != (timestamps["B"] is None):
+                print("[Dual] Only one of the two videos has capture times -- syncing both by frame number / fps instead")
+                timestamps = {"A": None, "B": None}
+            fps = min(camera_fps.values())
 
             # Same recording rules as run_video: a lower write rate than the
             # capture rate (see its comment on the encode feedback loop), and
@@ -2358,39 +2942,47 @@ class DualCameraTracker:
             max_catchup_frames_per_iteration = max(1, int(record_fps))
 
             stats = _SessionStats(stats_csv) if stats_csv else None
-            for end, cap in caps.items():
-                readers[end] = _FrameReader(cap, live=live[end])
-            # Merge windows need a clock that matches the footage: video files
-            # can be processed faster or slower than they were recorded.
-            frame_clock = not any(live.values())
+            frames_in = _SyncedFrames(caps, live, camera_fps, timestamps)
+            for end in caps:
+                self.trackers[end].async_person_filter = live[end]
+            annotated, raw = {}, {}
+            composed_at = 0.0
 
             while True:
-                frames, arrivals = {}, {}
-                for end, reader in readers.items():
-                    frames[end], arrivals[end] = reader.read()
-                ended = [end for end, frame in frames.items() if frame is None]
-                if ended:
-                    print(f"[Dual] Camera {' and '.join(ended)} stopped delivering frames -- ending the session")
+                new, t_or_ended = frames_in.next()
+                if new is None:
+                    print(f"[Dual] Camera {' and '.join(t_or_ended)} stopped delivering frames -- ending the session")
                     break
+                t = t_or_ended
                 self.pair_index += 1
-                for end in frames:
-                    frames[end] = _flip_frame(frames[end], *flips.get(end, (False, False)))
+                frames = {end: _flip_frame(frame, *flips.get(end, (False, False))) for end, (frame, _, _) in new.items()}
                 # Copied before process_frame draws on the frames (see run_video).
-                raw = {end: frames[end].copy() for end in ("A", "B") if end in outputs}
+                raw.update({end: frames[end].copy() for end in frames if end in outputs})
 
-                future = executor.submit(self.trackers["A"].process_frame, frames["A"])
-                annotated = {"B": self.trackers["B"].process_frame(frames["B"])}
-                annotated["A"] = future.result()
+                if len(frames) == 2:
+                    future = executor.submit(self.trackers["A"].process_frame, frames["A"])
+                    annotated["B"] = self.trackers["B"].process_frame(frames["B"])
+                    annotated["A"] = future.result()
+                else:
+                    for end, frame in frames.items():
+                        annotated[end] = self.trackers[end].process_frame(frame)
+                for end, (_, _, captured) in new.items():
+                    if live[end]:
+                        self.trackers[end].track_processing_rate(captured, camera_fps[end])
 
-                t = self.pair_index / fps if frame_clock else min(arrivals.values())
-                balls = self._update(t)
-                view = self._compose(annotated, balls)
+                balls = self._update({end: captured for end, (_, _, captured) in new.items()})
+                if len(annotated) < 2:
+                    continue  # both cameras' first frames are needed to show anything
+                now = time.perf_counter()
+                view = None
+                if outputs or (show_window and now - composed_at >= 1.0 / self.DISPLAY_FPS):
+                    view, composed_at = self._compose(annotated, balls), now
                 if stats is not None:
-                    # One pair = one "frame" here: fps is pairs per second, and
-                    # latency is from the older of the two frames' arrivals.
-                    stats.frame_done(min(arrivals.values()))
+                    # One step = one "frame" here: fps is steps per second, and
+                    # latency is from the older new frame's arrival.
+                    stats.frame_done(min(arrival for _, arrival, _ in new.values()))
 
-                if outputs:
+                if outputs and all(end in raw for end in ("A", "B") if end in outputs):
                     to_write = {"view": view, **raw}
                     if not writers:
                         for key, path in outputs.items():
@@ -2403,16 +2995,16 @@ class DualCameraTracker:
                             writer.write(to_write[key])
                         frames_written += 1
 
-                if show_window:
+                if show_window and view is not None:
                     if display is None:
                         display = _FrameDisplay("Project PickleVision - Dual Camera", view.shape[1], view.shape[0])
                     display.show(view)
-                    if display.quit_requested.is_set():
-                        break
+                if display is not None and display.quit_requested.is_set():
+                    break
         finally:
             executor.shutdown(wait=True)
-            for reader in readers.values():
-                reader.stop()
+            if frames_in is not None:
+                frames_in.stop()
             for cap in caps.values():
                 cap.release()
             for writer in writers.values():
@@ -2421,6 +3013,8 @@ class DualCameraTracker:
                 display.stop()
             if stats is not None:
                 stats.close()
+            if self.calibrated:
+                self.aligner.flush(force=True)
             for call in self.fusion.close_ready(t, close_all=True):
                 self._print_call(call)
 
@@ -2452,6 +3046,10 @@ def parse_args():
     parser.add_argument("--width", type=int, default=1280, help="Target camera width in pixels (default: 1280 -- 720p, the target for multi-camera headroom; 1920 for 1080p). Calibrate at the same size you track at")
     parser.add_argument("--height", type=int, default=720, help="Target camera height in pixels (default: 720; 1080 for 1080p)")
     parser.add_argument("--court-corners", type=str, default=None, help="Court calibration: x1 y1 x2 y2 x3 y3 x4 y4 (TL TR BR BL)")
+    parser.add_argument("--view", choices=["end", "side"], default="end", help="Where the camera watches from: 'end' (behind a baseline, the default) or 'side' (beside the court, e.g. level with the net). Calibrate and track with the same value. For one camera, 'side' calls bounces better: in simulation 95%% of landings right vs 85%% from an end (99%% vs 88%% with carefully clicked calibration corners), since from there a bounce always shows as a down-then-up in the image. Single camera only")
+    parser.add_argument("--record-raw", type=str, default=None, metavar="FILE.avi", help="Just record --source's camera (and --source2's: FILE_A.avi, FILE_B.avi), every frame at full rate, nothing else (no detection, no overlays), then exit. Saves each frame's capture time beside it (.timestamps.csv) so two cameras replay in sync. Doesn't lag like --raw-output; replay with --source FILE.avi (--source2 FILE_B.avi)")
+    parser.add_argument("--record-seconds", type=float, default=None, help="With --record-raw: stop after this many seconds (default: until 'q' or Ctrl+C)")
+    parser.add_argument("--list-cameras", action="store_true", help="List the camera indices that open, with the size and real frame rate each delivers at --width/--height/--fps, then exit -- the ELP is the one that keeps up 120fps")
     parser.add_argument("--calibrate-lens", action="store_true", help="Interactively measure the camera lens's fisheye/barrel bend by clicking points along straight court lines, save it (--lens-output), then exit. Use the result with --lens")
     parser.add_argument("--lens-output", type=str, default=None, help="Where --calibrate-lens saves the lens file (default: lens_cam<source>.json)")
     parser.add_argument("--lens", type=str, default=None, help="Lens file from --calibrate-lens for --source's camera: straightens its wide-angle bend before court mapping, so calibration and line calls match the real lines across the whole image. Use it for --calibrate as well as tracking, at the same --width/--height")
@@ -2650,6 +3248,34 @@ def _court_reference_lines(mapper: CourtMapper, include_far_half: bool = False):
     return pieces
 
 
+# Arrow keys as cv2.waitKeyEx reports them: Windows, then Linux (GTK).
+_ARROW_NUDGES = {
+    2424832: (-1, 0), 2555904: (1, 0), 2490368: (0, -1), 2621440: (0, 1),
+    65361: (-1, 0), 65363: (1, 0), 65362: (0, -1), 65364: (0, 1),
+}
+
+
+def _draw_magnifier(display, frame, center, zoom=8, half=16):
+    """An 8x close-up of the pixels around `center` with a crosshair on the
+    exact pixel, in a top corner of `display` (whichever is farther from it)."""
+    height, width = frame.shape[:2]
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    patch = np.zeros((2 * half + 1, 2 * half + 1, 3), np.uint8)
+    x0, y0 = cx - half, cy - half
+    sx0, sy0, sx1, sy1 = max(x0, 0), max(y0, 0), min(cx + half + 1, width), min(cy + half + 1, height)
+    if sx1 > sx0 and sy1 > sy0:
+        patch[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = frame[sy0:sy1, sx0:sx1]
+    big = cv2.resize(patch, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_NEAREST)
+    mid = half * zoom + zoom // 2
+    cv2.line(big, (mid, 0), (mid, big.shape[0] - 1), (0, 0, 255), 1)
+    cv2.line(big, (0, mid), (big.shape[1] - 1, mid), (0, 0, 255), 1)
+    size = big.shape[0]
+    ox = width - size - 10 if cx < width / 2 else 10
+    if size + 10 <= height and size + 10 <= width:
+        display[10:10 + size, ox:ox + size] = big
+        cv2.rectangle(display, (ox - 1, 9), (ox + size, 10 + size), (255, 255, 255), 1)
+
+
 def _draw_loupe(display, frame, cursor, zoom=4, radius=24):
     """A magnified view of the unannotated frame around the mouse, with a
     crosshair, for clicking a line's exact edge or corner. Drawn in the top
@@ -2674,7 +3300,7 @@ def _draw_loupe(display, frame, cursor, zoom=4, radius=24):
     cv2.rectangle(display, (left, 10), (left + big_w, 10 + big_h), (255, 255, 255), 1)
 
 
-def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0, flip_horizontal=False, flip_vertical=False, target_width: int = 1920, target_height: int = 1080, target_fps: int = 120, lens: "LensModel | None" = None):
+def calibrate_court_corners(source, save_path: str | None = None, court_width: float = 20.0, court_length: float = 44.0, flip_horizontal=False, flip_vertical=False, target_width: int = 1920, target_height: int = 1080, target_fps: int = 120, view: str = "end", lens: "LensModel | None" = None):
     """Interactively click the court's 4 real-world corners on a live camera feed.
 
     With lens (--lens, from --calibrate-lens) the preview is lens-corrected:
@@ -2682,15 +3308,23 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
     The saved corners are still the raw pixels clicked, so they're used with
     the same --lens when tracking.
 
-    Click order matters -- it must match CourtMapper's default destination
-    rectangle (TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT, i.e. clockwise
-    starting from whichever corner you treat as the origin).
+    Click order matters -- it must match CourtMapper's destination rectangle
+    (TOP-LEFT, TOP-RIGHT, BOTTOM-RIGHT, BOTTOM-LEFT as seen on screen, i.e.
+    clockwise starting from whichever corner you treat as the origin).
 
-    For a full court (court_length=44), TOP = far baseline, BOTTOM = near
-    baseline (the one closest to the camera). For a half-court calibration
-    (court_length=22, baseline-to-net only -- useful when the far half of the
-    court isn't reliably visible from this camera angle), TOP = the net line,
-    BOTTOM = the near baseline.
+    From an end (view="end"), for a full court (court_length=44), TOP = far
+    baseline, BOTTOM = near baseline (the one closest to the camera). For a
+    half-court calibration (court_length=22, baseline-to-net only -- useful
+    when the far half of the court isn't reliably visible from this camera
+    angle), TOP = the net line, BOTTOM = the near baseline. From beside the
+    court (view="side"), TOP = the far sideline, BOTTOM = the near sideline.
+
+    Click the OUTSIDE corner of the painted lines: the lines are part of the
+    court. Calibration precision is most of what's left of line-call error:
+    in simulation, clicks off by 2px got 89% of calls within 0.5ft of a line
+    right from the side, 0.7px clicks 98%. Hence the magnifier -- an 8x
+    close-up with a crosshair on the exact pixel under the mouse -- and the
+    arrow keys, which nudge the last point placed by 1px.
 
     Press 's' to save once 4 points are placed, 'r' to reset, 'q' to cancel.
 
@@ -2715,23 +3349,30 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
         actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"[Camera Config] Requesting {target_width}x{target_height} @ {target_fps}fps (MJPEG) -> got {actual_width}x{actual_height}")
 
-    clicked: list[tuple[int, int]] = []
-    cursor: list[tuple[int, int]] = []
+    clicked: list[list[int]] = []
+    focus = {"point": None}
 
-    def on_click(event, x, y, flags, param):
-        cursor[:] = [(x, y)]
-        if event == cv2.EVENT_LBUTTONDOWN and len(clicked) < 4:
-            clicked.append((x, y))
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEMOVE:
+            focus["point"] = (x, y)
+        elif event == cv2.EVENT_LBUTTONDOWN and len(clicked) < 4:
+            clicked.append([x, y])
+            focus["point"] = (x, y)
 
     window_name = "Court Calibration"
     cv2.namedWindow(window_name)
-    cv2.setMouseCallback(window_name, on_click)
+    cv2.setMouseCallback(window_name, on_mouse)
 
-    far_edge_label = "the NET line" if abs(court_length - 44.0) >= 1.0 else "the FAR baseline"
-    print(f"Calibrating a {court_width:.0f}x{court_length:.0f} ft region.")
+    if view == "side":
+        top_edge, bottom_edge = "the FAR sideline", "the NEAR sideline"
+    else:
+        top_edge = "the NET line" if abs(court_length - 44.0) >= 1.0 else "the FAR baseline"
+        bottom_edge = "the NEAR baseline"
+    print(f"Calibrating a {court_width:.0f}x{court_length:.0f} ft region, camera at the {view} of the court.")
     print("Lens correction: " + ("ON" if lens is not None else "off (add --lens from --calibrate-lens for a wide-angle lens)"))
-    print(f"Click in order: TOP-LEFT, TOP-RIGHT ({far_edge_label}), then BOTTOM-RIGHT, BOTTOM-LEFT (the NEAR baseline).")
-    print("Keys: 'r' reset points | 's' save (once 4 are placed) | 'q' cancel")
+    print(f"Click in order: TOP-LEFT, TOP-RIGHT ({top_edge}), then BOTTOM-RIGHT, BOTTOM-LEFT ({bottom_edge}).")
+    print("Click the OUTSIDE corner of the painted lines (the lines are in). The magnifier shows the exact pixel;")
+    print("arrow keys nudge the last point 1px. Keys: 'r' reset points | 's' save (once 4 are placed) | 'q' cancel")
 
     corner_str = None
     try:
@@ -2752,13 +3393,14 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
 
             display = frame.copy()
             for i, pt in enumerate(clicked):
-                cv2.circle(display, pt, 6, (0, 0, 255), -1)
+                # Small, so it doesn't hide the corner it marks.
+                cv2.circle(display, tuple(pt), 3, (0, 0, 255), -1)
                 cv2.putText(display, str(i + 1), (pt[0] + 8, pt[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             if len(clicked) == 4:
                 if lens is None:
                     pts = np.array(clicked, dtype=np.int32)
-                    cv2.polylines(display, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+                    cv2.polylines(display, [pts], isClosed=True, color=(0, 255, 0), thickness=1)
                 cv2.putText(display, "Press 's' to save, 'r' to reset", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 try:
@@ -2767,6 +3409,7 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
                         court_width=court_width,
                         court_length=court_length,
                         lens=lens,
+                        view=view,
                     )
                     if lens is not None:
                         # The outline between the clicked corners, bent like the real lines.
@@ -2797,11 +3440,20 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
                         1,
                     )
             else:
-                cv2.putText(display, f"Click corner {len(clicked) + 1}/4", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(display, f"Click corner {len(clicked) + 1}/4 (outside corner of the lines)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            _draw_loupe(display, frame, cursor[0] if cursor else None)
+            if focus["point"] is not None:
+                _draw_magnifier(display, frame, focus["point"])
+
             cv2.imshow(window_name, display)
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKeyEx(1)
+            if key in _ARROW_NUDGES and clicked:
+                dx, dy = _ARROW_NUDGES[key]
+                clicked[-1][0] += dx
+                clicked[-1][1] += dy
+                focus["point"] = tuple(clicked[-1])
+                continue
+            key &= 0xFF
             if key == ord("q"):
                 break
             if key == ord("r"):
@@ -2817,10 +3469,10 @@ def calibrate_court_corners(source, save_path: str | None = None, court_width: f
         print("Calibration cancelled -- no corners saved.")
         return None
 
-    print(f"\n--court-corners \"{corner_str}\"")
+    print(f"\n{'--view side ' if view == 'side' else ''}--court-corners \"{corner_str}\"")
     if save_path:
         Path(save_path).write_text(corner_str)
-        print(f"Saved to {save_path}")
+        print(f"Saved to {save_path}" + (" -- track with --view side too" if view == "side" else ""))
 
     return corner_str
 
@@ -3246,6 +3898,183 @@ def check_dual_camera_alignment(
         cv2.destroyAllWindows()
 
 
+class _RawRecorder:
+    """One camera of --record-raw: a capture thread reading every frame the
+    camera delivers, stamping its capture time, and a writer thread encoding
+    it (MJPEG .avi) and its time (.timestamps.csv beside it). The queue
+    between them absorbs encoding hiccups, so capture never waits on disk."""
+
+    def __init__(self, cap, path, fps, start):
+        import queue
+        import threading
+
+        self.cap, self.path, self.start = cap, path, start
+        self.size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self.fps = fps
+        self._writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, self.size)
+        if not self._writer.isOpened():
+            raise SystemExit(f"Couldn't open {path} for writing")
+        self._times = open(_timestamps_path(path), "w")
+        self._times.write("frame,seconds\n")
+        self._queue: "queue.Queue" = queue.Queue(maxsize=fps * 4)  # up to ~4 s of backlog
+        self.latest = None
+        self.captured = self.written = self.dropped = 0
+        self.failed = False
+        self._stopped = threading.Event()
+        self._threads = [threading.Thread(target=self._capture, daemon=True), threading.Thread(target=self._write, daemon=True)]
+        for thread in self._threads:
+            thread.start()
+
+    def _capture(self):
+        import queue
+
+        while not self._stopped.is_set():
+            try:
+                ok, frame = self.cap.read()
+            except cv2.error:
+                ok = False
+            if not ok:
+                self.failed = True
+                break
+            stamp = time.perf_counter() - self.start
+            self.captured += 1
+            self.latest = frame
+            try:
+                self._queue.put_nowait((frame, stamp))
+            except queue.Full:
+                self.dropped += 1  # encoding fell ~4 s behind; keep capturing live
+        self._queue.put(None)
+
+    def _write(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            frame, stamp = item
+            self._writer.write(frame)
+            self._times.write(f"{self.written},{stamp:.6f}\n")
+            self.written += 1
+
+    def stop(self):
+        self._stopped.set()
+        for thread in self._threads:
+            thread.join()
+        self._writer.release()
+        self._times.close()
+        self.cap.release()
+
+
+def record_raw(sources, path, target_width, target_height, target_fps, show_window=True, seconds=None):
+    """--record-raw: save every frame the camera(s) deliver, and nothing else
+    -- footage the tracker can be re-run on later (--source <file>, and
+    --source2 for the second camera's), as many times as needed.
+
+    Recording through the tracker (--raw-output) lags: every frame is also
+    detected and re-encoded on the same machine, and it's frame-paced to the
+    wall clock, so behind schedule it writes duplicate frames. Here nothing
+    else runs (see _RawRecorder). Each video gets its frames' capture times
+    beside it (.timestamps.csv): the tracker replays two cameras' videos in
+    sync by those (_SyncedFrames), and times detection to the rate the camera
+    really delivered. sources is a list of one or two cameras; with two, path
+    raw1.avi saves raw1_A.avi and raw1_B.avi. Stops on 'q' in the preview,
+    Ctrl+C, or after `seconds`.
+    """
+    path = Path(path)
+    if path.suffix.lower() != ".avi":
+        path = path.with_suffix(".avi")
+        print(f"[Record] MJPEG needs an .avi file -- saving to {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ends = ["A", "B"][: len(sources)]
+    paths = {end: path.with_name(f"{path.stem}_{end}.avi") if len(sources) > 1 else path for end in ends}
+    caps = {}
+    try:
+        for end, source in zip(ends, sources):
+            caps[end], _ = _open_video_source(source, target_width, target_height, target_fps)
+    except Exception:
+        for cap in caps.values():
+            cap.release()
+        raise
+    start = time.perf_counter()
+    recorders = {end: _RawRecorder(caps[end], paths[end], int(caps[end].get(cv2.CAP_PROP_FPS)) or 30, start) for end in ends}
+    for end, source in zip(ends, sources):
+        rec = recorders[end]
+        label = f"Camera {end} ({source})" if len(sources) > 1 else f"Camera {source}"
+        print(f"[Record] {label}: {rec.size[0]}x{rec.size[1]} @ {rec.fps}fps -> {rec.path}")
+    print("[Record] Recording -- 'q' in the preview or Ctrl+C to stop")
+    display = None
+    if show_window:
+        width = 1280 if len(sources) > 1 else min(recorders["A"].size[0], 1280)
+        display = _FrameDisplay("Recording -- 'q' to stop", width, 360 if len(sources) > 1 else 720, max_fps=30)
+    try:
+        while seconds is None or time.perf_counter() - start < seconds:
+            if any(rec.failed for rec in recorders.values()):
+                print("[Record] " + ", ".join(f"camera {end}" for end, rec in recorders.items() if rec.failed) + " stopped delivering frames.")
+                break
+            if display is not None:
+                latest = [rec.latest for rec in recorders.values()]
+                if all(frame is not None for frame in latest):
+                    display.show(np.hstack([cv2.resize(frame, (640, 360)) for frame in latest]) if len(latest) > 1 else latest[0])
+                if display.quit_requested.is_set():
+                    break
+            time.sleep(1 / 30)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        elapsed = time.perf_counter() - start
+        for rec in recorders.values():
+            rec.stop()
+        if display is not None:
+            display.stop()
+    for end, rec in recorders.items():
+        label = f"Camera {end}" if len(sources) > 1 else "Camera"
+        print(f"[Record] {label}: {rec.captured} frames in {elapsed:.1f}s ({rec.captured / max(elapsed, 1e-9):.0f} fps delivered), "
+              f"{rec.written} saved, {rec.dropped} dropped -> {rec.path}")
+    if len(sources) > 1:
+        print(f"[Record] Track them later with: --source \"{paths['A']}\" --source2 \"{paths['B']}\"")
+    else:
+        print(f"[Record] Track it later with: --source \"{path}\"")
+
+
+def list_cameras(target_width, target_height, target_fps, max_index=6):
+    """--list-cameras: each camera index that opens, with the size it gives
+    and the frame rate it really delivers at the requested mode (measured,
+    not what the driver reports) -- the ELP is the one keeping up 120fps."""
+    print(f"Checking camera indices 0-{max_index - 1} at {target_width}x{target_height} @ {target_fps}fps (MJPEG)...")
+    # OpenCV warns for every index with no camera behind it -- expected here.
+    log_level = cv2.getLogLevel()
+    cv2.setLogLevel(2)  # errors only
+    found = 0
+    for index in range(max_index):
+        cap = _open_camera(index)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        found += 1
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+        cap.set(cv2.CAP_PROP_FPS, target_fps)
+        width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frames, measured = 0, 0.0
+        try:
+            for _ in range(5):  # the first frames after opening come slowly
+                cap.read()
+            start = time.perf_counter()
+            while time.perf_counter() - start < 1.5:
+                ok, _ = cap.read()
+                if not ok:
+                    break
+                frames += 1
+            measured = frames / (time.perf_counter() - start)
+        except cv2.error:
+            pass
+        print(f"  --source {index}: {width}x{height}, delivering ~{measured:.0f} fps")
+        cap.release()
+    cv2.setLogLevel(log_level)
+    if not found:
+        print("  No cameras opened.")
+
+
 def _load_lens(path, args, flag="--lens"):
     """The LensModel saved by --calibrate-lens at path, or None if no path.
     Refuses one fitted at a different resolution than --width/--height: USB
@@ -3267,7 +4096,7 @@ def _build_tracker(args, court_corners, camera_id="cam0", shared_roboflow_model=
     court_corners (a --court-corners string), or uncalibrated if it's None."""
     court_points = CourtMapper.parse_corners(court_corners) if court_corners else None
     court_mapper = (
-        CourtMapper(src_points=court_points, court_width=args.court_width, court_length=args.court_length, lens=lens)
+        CourtMapper(src_points=court_points, court_width=args.court_width, court_length=args.court_length, lens=lens, view=args.view)
         if court_points is not None
         else None
     )
@@ -3309,7 +4138,7 @@ def _build_tracker(args, court_corners, camera_id="cam0", shared_roboflow_model=
     )
 
 
-def _warm_up(tracker, args):
+def _warm_up(tracker, args, *others):
     print(f"[Device] Running inference on: {tracker.device}")
     if tracker.roboflow_local_model is not None:
         # Warm up here so the one-time TensorRT engine build (or CUDA init)
@@ -3317,6 +4146,11 @@ def _warm_up(tracker, args):
         # the first live frame.
         tracker.roboflow_local_model.infer(np.zeros((args.height, args.width, 3), np.uint8))
         print(f"[Device] Model backend: {tracker.roboflow_local_model.onnx_session.get_providers()[0]}")
+    for each in (tracker, *others):
+        if each.person_model is not None:
+            # Its first call sets up CUDA kernels (~1 s): otherwise the first
+            # second of tracking runs at a third of its speed.
+            each._find_people(np.zeros((args.height, args.width, 3), np.uint8))
 
 
 def _run_dual_camera(args, source):
@@ -3339,7 +4173,7 @@ def _run_dual_camera(args, source):
         shared_roboflow_model=tracker_a.roboflow_local_model,
         lens=_load_lens(args.lens2, args, "--lens2"),
     )
-    _warm_up(tracker_a, args)
+    _warm_up(tracker_a, args, tracker_b)
 
     dual = DualCameraTracker(
         tracker_a, tracker_b, court_width=args.court_width, half_length=args.court_length, agreement_ft=args.bounce_agreement_ft
@@ -3381,6 +4215,20 @@ def main():
     if isinstance(source, str) and source.isdigit():
         source = int(source)
 
+    if args.record_raw:
+        sources = [source] if args.source2 is None else [source, int(args.source2) if str(args.source2).isdigit() else args.source2]
+        record_raw(sources, args.record_raw, args.width, args.height, args.fps, show_window=args.show, seconds=args.record_seconds)
+        return
+
+    if args.list_cameras:
+        list_cameras(args.width, args.height, args.fps)
+        return
+
+    if args.view == "side" and (args.source2 is not None or args.check_alignment):
+        raise SystemExit("--view side is for a single camera; the two-camera modes use end cameras")
+    if args.view == "side" and abs(args.court_length - 44.0) >= 1.0:
+        raise SystemExit("--view side calibrates the whole court -- leave --court-length at 44")
+
     if args.calibrate_lens:
         calibrate_lens(
             source,
@@ -3404,6 +4252,7 @@ def main():
             target_width=args.width,
             target_height=args.height,
             target_fps=args.fps,
+            view=args.view,
             lens=_load_lens(args.lens, args),
         )
         return
@@ -3451,7 +4300,11 @@ def main():
             or f"logs/session_{time.strftime('%Y%m%d_%H%M%S')}_cam{Path(str(args.source)).stem}.csv"
         ) if args.stats else None,
     )
-    print(f"\n[Summary] Tracked {len(events)} candidate ball events.")
+    ins = sum(event.line_call == "IN" for event in events)
+    if tracker.court_calibrated:
+        print(f"\n[Summary] {len(events)} bounces called: {ins} IN, {len(events) - ins} OUT.")
+    else:
+        print(f"\n[Summary] {len(events)} bounces detected -- calibrate (--court-corners) for IN/OUT calls.")
 
 
 if __name__ == "__main__":
