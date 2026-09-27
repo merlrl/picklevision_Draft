@@ -11,7 +11,7 @@ import time
 _PROCESS_START = time.perf_counter()
 
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -161,6 +161,35 @@ def _open_video_source(source, target_width, target_height, target_fps):
     return cap, is_live
 
 
+def _timestamps_path(video_path):
+    """Where --record-raw saves a video's per-frame capture times: beside it,
+    raw1.avi -> raw1.timestamps.csv."""
+    path = Path(video_path)
+    return path.with_name(path.stem + ".timestamps.csv")
+
+
+def _load_timestamps(source):
+    """Each frame's capture time (s) for a video --record-raw saved, or None
+    (a live camera, or a video without them)."""
+    if not isinstance(source, (str, Path)):
+        return None
+    path = _timestamps_path(source)
+    if not path.exists():
+        return None
+    return np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)[:, 1]
+
+
+def _delivered_fps(times):
+    """The frame rate a camera really delivered, from its frames' capture
+    times -- a video file's own fps is only the rate it was asked for (an ELP
+    set to 120 delivers 60 or less when dim light lengthens its exposure).
+    The average over the whole video: frames read without a driver timestamp
+    are stamped on arrival, and some cameras hand them over in bursts."""
+    if len(times) < 2 or times[-1] <= times[0]:
+        return None
+    return round((len(times) - 1) / float(times[-1] - times[0]))
+
+
 def _flip_frame(frame, horizontal, vertical):
     """Apply --flip-horizontal/--flip-vertical (or a second camera's own) to a frame."""
     if not (horizontal or vertical):
@@ -188,14 +217,18 @@ class _FrameReader:
     behind, stale frames are dropped so what's processed is always current.
     live=False (a video file) queues every frame, blocking the reader when
     the queue is full, so offline evaluation never skips a frame.
+
+    notify (a threading.Event) is set whenever a frame (or the end) arrives --
+    so one loop can wait on several cameras at once (DualCameraTracker).
     """
 
-    def __init__(self, cap, live, queue_size=4):
+    def __init__(self, cap, live, queue_size=4, notify=None):
         import queue
         import threading
 
         self.cap = cap
         self.live = live
+        self._notify = notify
         self._queue = queue.Queue(maxsize=1 if live else queue_size)
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -207,15 +240,27 @@ class _FrameReader:
         while not self._stopped.is_set():
             try:
                 ok, frame = self.cap.read()
-            except cv2.error:
-                # read() can throw instead of returning False -- seen on the
-                # built-in webcam when asked for a size it doesn't support.
-                # Treated as the source failing; otherwise this thread dies
-                # and the tracking loop waits forever for its next frame.
+            except Exception as error:
+                # read() can throw instead of returning False -- seen (a
+                # cv2.error) on the built-in webcam when asked for a size it
+                # doesn't support. Treated as the source failing; otherwise
+                # this thread dies and the tracking loop waits forever for
+                # its next frame.
+                print(f"[Camera] Reading a frame failed: {error!r}")
                 ok, frame = False, None
             # Arrival time rides along with the frame, so --stats can measure
-            # latency from capture to tracked, queue wait included.
-            item = (frame, time.perf_counter()) if ok else (None, None)
+            # latency from capture to tracked, queue wait included -- and so
+            # does its capture time: a camera's driver (Windows MSMF) stamps
+            # each frame on the same clock as perf_counter. It can be 80-270 ms
+            # before arrival (measured on a laptop webcam, varying frame to
+            # frame), so two cameras' arrival times don't line their frames up.
+            arrival = time.perf_counter()
+            captured = arrival
+            if ok and self.live:
+                driver_time = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if 0.0 <= arrival - driver_time < 2.0:
+                    captured = driver_time
+            item = (frame, arrival, captured) if ok else (None, None, None)
             if self.live:
                 try:
                     self._queue.get_nowait()  # drop the stale frame, if any
@@ -229,16 +274,109 @@ class _FrameReader:
                         break
                     except queue.Full:
                         continue
+            if self._notify is not None:
+                self._notify.set()
             if not ok:
                 return
 
     def read(self):
-        """Next (frame, arrival_time), or (None, None) once the source is exhausted/failed."""
+        """Next (frame, arrival_time, capture_time), or (None, None, None) once
+        the source is exhausted/failed. (A video file's capture_time is just
+        its arrival; _SyncedFrames gives it the real one.)"""
         return self._queue.get()
+
+    def poll(self):
+        """Like read(), but None right away if no frame is waiting."""
+        import queue
+
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def stop(self):
         self._stopped.set()
         self._thread.join(timeout=1.0)
+
+
+class _SyncedFrames:
+    """Each step's new frames from the two end cameras, in time order.
+
+    Live cameras: whichever have delivered a frame since the last step --
+    normally both, but a slower camera (an ELP drops from 120fps to 60 or
+    less when dim light lengthens its exposure) is just processed less often,
+    rather than holding the other one to its pace. Step time = arrival.
+
+    Video files: frames in the order they were captured, by each file's
+    capture times (saved beside it by --record-raw) or else frame number /
+    fps; frames within half a frame period of each other are one step.
+    Pairing frame N with frame N instead drifts apart -- two cameras never
+    deliver exactly the same rate, and each drops frames of its own -- and
+    breaks outright with cameras at different rates.
+    """
+
+    def __init__(self, caps, live, fps, timestamps):
+        import threading
+
+        self.live = live
+        self._arrived = threading.Event()
+        self.readers = {end: _FrameReader(cap, live=live[end], notify=self._arrived) for end, cap in caps.items()}
+        self._fps = fps
+        self._times = timestamps
+        self._count = {end: 0 for end in caps}
+        self._buffered = {}
+        self._tolerance = 0.5 / max(fps.values())
+
+    def next(self):
+        """({camera: (frame, arrival, capture time)} for the cameras with a new
+        frame, step time in s) -- or (None, [the cameras whose source ended])."""
+        if any(self.live.values()):
+            return self._next_live()
+        return self._next_file()
+
+    def _next_live(self):
+        new, waited = {}, 0.0
+        while not new:
+            if not self._arrived.wait(timeout=1.0):
+                waited += 1.0
+                if waited == 3.0:
+                    print("[Dual] No frames from either camera for 3 s -- still waiting (unplugged? 'q' to quit)")
+                continue
+            self._arrived.clear()
+            for end, reader in self.readers.items():
+                item = reader.poll()
+                if item is not None:
+                    new[end] = item
+        ended = [end for end, (frame, _, _) in new.items() if frame is None]
+        if ended:
+            return None, ended
+        return new, min(captured for _, _, captured in new.values())
+
+    def _file_time(self, end):
+        times, index = self._times.get(end), self._count[end]
+        if times is not None and index < len(times):
+            return float(times[index])
+        return index / self._fps[end]
+
+    def _next_file(self):
+        for end, reader in self.readers.items():
+            if end not in self._buffered:
+                self._buffered[end] = (reader.read(), self._file_time(end))
+                self._count[end] += 1
+        ended = [end for end, (item, _) in self._buffered.items() if item[0] is None]
+        if ended:
+            return None, ended
+        t = min(frame_time for _, frame_time in self._buffered.values())
+        new = {}
+        for end, ((frame, arrival, _), frame_time) in list(self._buffered.items()):
+            if frame_time <= t + self._tolerance:
+                new[end] = (frame, arrival, frame_time)
+                del self._buffered[end]
+        return new, t
+
+    def stop(self):
+        for reader in self.readers.values():
+            reader.stop()
 
 
 class _FrameDisplay:
@@ -434,6 +572,9 @@ class BallEvent:
     centroid: tuple[float, float]
     velocity: float = 0.0
     landing_point: tuple[float, float] | None = None
+    # The frame the ball touched down in -- frame_index is when it was
+    # recognized, a few frames later (the detector needs the rise too).
+    landing_frame: int | None = None
     line_call: str = "UNKNOWN"
     timestamp: float = field(default_factory=time.time)
     # Tags which camera produced this event: "A"/"B" in dual-camera mode
@@ -930,12 +1071,22 @@ class PickleVisionTracker:
         # Frame of the last low point reported as a bounce, per track, so
         # each bounce is reported once (see _detect_ball_contact).
         self._last_bounce_frames: dict = {}
+        self.last_landing_frame: int | None = None
         # Frame-rate dependent settings -- see set_frame_rate.
+        self.frame_rate = 120
         self.bounce_side_points = self.BOUNCE_SIDE_POINTS
         self.kink_min_slowdown = self.KINK_MIN_SLOWDOWN
         self.person_refresh_frames = 1
+        # Live sources: when the last processed frames arrived (see track_processing_rate).
+        self._processed_at: deque = deque()
+        self._rate_checked_at = 0.0
+        self._rate_started_at: float | None = None
         self._person_boxes: list = []
         self._person_boxes_frame: int | None = None
+        # Live sources run the person filter on a worker thread (see _detect_people).
+        self.async_person_filter = False
+        self._person_worker = None
+        self._person_pending = None
 
         # Internal bookkeeping IDs (primary_track_id) can legitimately change
         # every single frame for the Roboflow backend -- IDs are deliberately
@@ -1095,6 +1246,7 @@ class PickleVisionTracker:
         if low_frame <= self._last_bounce_frames.get(key, -1) + side:
             return None
         self._last_bounce_frames[key] = low_frame
+        self.last_landing_frame = low_frame
         landing_x, landing_y = self._fit_landing(pts, t, fall, rise)
         if radii is not None:
             # The ball touches the ground at its bottom, not its center: a
@@ -1235,9 +1387,37 @@ class PickleVisionTracker:
         camera would otherwise need 8 frames = 267 ms after every bounce), and
         how often the person filter re-runs (~30 times a second)."""
         fps = fps or 30
+        self.frame_rate = fps
         self.bounce_side_points = max(3, round(self.BOUNCE_SIDE_POINTS * fps / 120))
         self.kink_min_slowdown = self.KINK_MIN_SLOWDOWN * 120 / fps  # px per frame grows as frames get further apart
         self.person_refresh_frames = max(1, round(fps / 30))
+
+    def track_processing_rate(self, now, camera_fps):
+        """Live sources: time the frame-count settings (set_frame_rate) to
+        the frames actually processed, not the camera's rate. A live camera's
+        newest frame is taken each step and the rest dropped, so when
+        processing can't keep up -- two 120fps cameras on one laptop GPU run
+        ~60 pairs/s -- the detector sees every 2nd frame, and its 8-frame
+        bounce window at "120fps" really spans twice as long. In simulation
+        at 60 processed fps: 89/120 landings right timed for 120, 98 timed
+        for 60; at 40: 70 vs 93. Re-checked twice a second from the last
+        second's frames; re-timed on a change of more than 10%. The first
+        1.5 s are skipped: startup (window, first GPU calls) runs slow.
+        """
+        times = self._processed_at
+        if self._rate_started_at is None:
+            self._rate_started_at = now
+        times.append(now)
+        while now - times[0] > 1.0:
+            times.popleft()
+        if now - self._rate_started_at < 1.5 or now - self._rate_checked_at < 0.5 or len(times) < 10:
+            return
+        self._rate_checked_at = now
+        rate = min(float(camera_fps), (len(times) - 1) / (times[-1] - times[0]))
+        if abs(rate - self.frame_rate) > 0.1 * self.frame_rate:
+            if self.frame_rate == camera_fps or abs(rate - self.frame_rate) > 0.25 * self.frame_rate:
+                print(f"{self.log_prefix}[Rate] Processing {rate:.0f} of the camera's {camera_fps} frames/s -- bounce detection timed for {rate:.0f}")
+            self.set_frame_rate(round(rate))
 
     def _compute_zoom_roi(self, frame_width, frame_height):
         """Bounding box (with padding) around the calibrated court corners, in
@@ -1286,18 +1466,37 @@ class PickleVisionTracker:
         set_frame_rate): people barely move in that time, and running the
         detector on every frame (~9 ms on an RTX 4050 Laptop) is what held
         processing below a 120fps camera's frame rate.
+
+        With async_person_filter (live sources) the refresh runs on a worker
+        thread and this returns the latest finished boxes without waiting --
+        one refresh (~1/30 s) older, which people don't notice either. In
+        dual-camera mode it was ~5 ms of every pair's critical path. Video
+        files keep it synchronous, so re-running one gives the same result.
         """
         if self.person_model is None:
             return []
+        pending = self._person_pending
+        if pending is not None and pending.done():
+            self._person_boxes, self._person_pending = pending.result(), None
         if self._person_boxes_frame is not None and self.frame_index - self._person_boxes_frame < self.person_refresh_frames:
             return self._person_boxes
+        self._person_boxes_frame = self.frame_index
+        if not self.async_person_filter:
+            self._person_boxes = self._find_people(frame)
+        elif self._person_pending is None:
+            if self._person_worker is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._person_worker = ThreadPoolExecutor(max_workers=1)
+            # A copy: the caller goes on to draw on this frame.
+            self._person_pending = self._person_worker.submit(self._find_people, frame.copy())
+        return self._person_boxes
+
+    def _find_people(self, frame):
         results = self.person_model.predict(frame, classes=[0], conf=0.3, verbose=False)
         if not results or results[0].boxes is None or len(results[0].boxes) == 0:
-            boxes = []
-        else:
-            boxes = results[0].boxes.xyxy.cpu().numpy().tolist()
-        self._person_boxes, self._person_boxes_frame = boxes, self.frame_index
-        return boxes
+            return []
+        return results[0].boxes.xyxy.cpu().numpy().tolist()
 
     @staticmethod
     def _point_in_any_box(point, boxes):
@@ -1633,6 +1832,7 @@ class PickleVisionTracker:
                     centroid=(center_x, center_y),
                     velocity=velocity,
                     landing_point=landing_point,
+                    landing_frame=self.last_landing_frame,
                     line_call=call,
                     camera_id=self.camera_id,
                 )
@@ -1704,6 +1904,7 @@ class PickleVisionTracker:
                         centroid=(center_x, center_y),
                         velocity=velocity,
                         landing_point=landing_point,
+                        landing_frame=self.last_landing_frame,
                         line_call=call,
                         camera_id=self.camera_id,
                     )
@@ -2002,6 +2203,11 @@ class PickleVisionTracker:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         print(f"[Camera Actual] {width}x{height} @ {fps}fps")
+        times = None if isinstance(video_source, int) else _load_timestamps(video_source)
+        delivered = _delivered_fps(times) if times is not None else None
+        if delivered and abs(delivered - fps) > 0.1 * fps:
+            print(f"[Camera Actual] ...but it really delivered {delivered}fps when recorded (from its capture times)")
+            fps = delivered
         self.set_frame_rate(fps)
 
         # Recording writes video-encode (CPU) work on top of detection work -- a
@@ -2082,9 +2288,10 @@ class PickleVisionTracker:
 
         stats = _SessionStats(stats_csv) if stats_csv else None
         reader = _FrameReader(cap, live=isinstance(video_source, int))
+        self.async_person_filter = reader.live
         try:
             while True:
-                frame, arrived_at = reader.read()
+                frame, arrived_at, _ = reader.read()
                 if frame is None:
                     break
 
@@ -2098,6 +2305,8 @@ class PickleVisionTracker:
                 raw_frame = frame.copy() if raw_writer is not None else None
 
                 annotated = self.process_frame(frame)
+                if reader.live:
+                    self.track_processing_rate(arrived_at, fps)
                 if stats is not None:
                     stats.frame_done(arrived_at)
                 self._draw_court_and_call(annotated)
@@ -2198,6 +2407,10 @@ class DualCameraFusion:
     # Whether the ball has been in the air since the last bounce is only
     # known while both cameras see it; after this long without, it's unknown.
     AIRBORNE_MEMORY_S = 0.5
+    # Roughly how far behind its baseline each end camera stands (ft) --
+    # only used to weight the two cameras' readings (see _ground_point), so
+    # being a few feet off barely matters.
+    CAMERA_SETBACK_FT = 15.0
 
     def __init__(self, court_width=20.0, half_length=22.0, agreement_ft=3.0):
         self.court_width = court_width
@@ -2258,13 +2471,33 @@ class DualCameraFusion:
             return
         (_, _, before, _, _), (t_low, frame_low, low, low_a, low_b), (_, _, after, _, _) = self._gaps
         if low < before and low <= after and low <= self.agreement_ft:
-            midpoint = ((low_a[0] + low_b[0]) / 2, (low_a[1] + low_b[1]) / 2)
-            camera = self.home_camera(midpoint)
+            point = self._ground_point(low_a, low_b)
+            camera = self.home_camera(point)
             self._add({
-                "camera": camera, "source": "ground", "point": low_a if camera == "A" else low_b,
+                "camera": camera, "source": "ground", "point": point,
                 "status": "CONFIRMED", "gap": low, "t": t_low, "frame_index": frame_low,
             })
             self._airborne = False
+
+    def _ground_point(self, point_a, point_b):
+        """The landing spot from both cameras' readings at the ground check's
+        low point. That sample is the frame closest to contact, but rarely
+        at it: the ball is still up to a frame's fall above the ground, and
+        each camera maps a raised ball away from itself along its line of
+        sight -- ~7 ft per ft of height -- so the two readings straddle the
+        true spot. It sits closer to the nearer camera's reading, in
+        proportion to the two cameras' distances. In simulation (a dink
+        landing 3 ft past the net, cameras at 120fps + 60fps) the home
+        camera's reading alone was 1.1-1.4 ft off; this cancels most of it.
+        """
+        y = (point_a[1] + point_b[1]) / 2
+        distance_a = max(1.0, y + self.CAMERA_SETBACK_FT)
+        distance_b = max(1.0, 2 * self.half_length - y + self.CAMERA_SETBACK_FT)
+        weight_a = distance_b / (distance_a + distance_b)
+        return (
+            weight_a * point_a[0] + (1 - weight_a) * point_b[0],
+            weight_a * point_a[1] + (1 - weight_a) * point_b[1],
+        )
 
     def add_flag(self, camera, court_point, other_camera_point, t, frame_index):
         """A bounce flagged by `camera`'s own _detect_ball_contact at
@@ -2362,6 +2595,122 @@ class DualCameraFusion:
         )
 
 
+class CaptureTimeAligner:
+    """Feeds DualCameraFusion in capture-time order, pairing each camera's
+    ball position with where the OTHER camera saw the ball at that same
+    instant -- interpolated between that camera's frames just before and
+    after it.
+
+    The fusion's ground check compares two cameras' court positions for the
+    ball, and a ball in flight moves ~0.5 ft per 120fps frame: positions
+    even a few ms apart differ by more than the calibrations do. Frames
+    processed together aren't captured together -- the cameras aren't
+    synchronized, one can run slower (dim light) or be skipped a step, and
+    each driver hands its frames over 80-270 ms after capture, varying frame
+    to frame (a laptop webcam, measured) -- so pairing by processing step
+    compares the ball at two different moments. Each sample waits here
+    until the other camera has a frame after it (a frame period or so), then
+    goes to the fusion.
+
+    A bounce flag is paired the same way, at its landing frame's capture
+    time: it's raised a few frames after the landing (the detector needs the
+    rise too), when the other camera's current view shows the ball already
+    back up in the air.
+    """
+
+    # Interpolate only across a gap this short in the other camera's frames
+    # (~8 frames at 120fps): longer, and the ball's path between isn't a line.
+    MAX_BRACKET_S = 0.07
+    # A camera whose newest frame is this far behind the other's is stalled
+    # or unplugged: samples stop waiting for it.
+    STALE_S = 0.3
+    HISTORY_S = 2.0
+
+    def __init__(self, fusion):
+        self.fusion = fusion
+        # Per camera, every processed frame as (capture time, court point of
+        # a real detection, or None), in time order.
+        self.history: dict[str, list] = {"A": [], "B": []}
+        # Each camera's frame_index -> capture time, for its bounce flags' landing frames.
+        self.frame_times: dict[str, dict[int, float]] = {"A": {}, "B": {}}
+        self._pending: list = []
+        self._order = 0
+        self.emitted_until = float("-inf")
+
+    def add_frame(self, end, frame_index, t, court_point):
+        """One processed frame of camera `end`, captured at t: its court
+        point for the ball (a real detection), or None."""
+        history = self.history[end]
+        if history and t <= history[-1][0]:
+            return  # a repeated or out-of-order capture time: nothing new
+        history.append((t, court_point))
+        while history and history[0][0] < t - self.HISTORY_S:
+            history.pop(0)
+        times = self.frame_times[end]
+        times[frame_index] = t
+        for old in [index for index in times if index < frame_index - 1000]:
+            del times[old]
+        self._push(t, 0, end, court_point, frame_index)
+
+    def add_flag(self, end, landing_frame, court_point, fallback_t):
+        """A bounce flag from camera `end`'s own detector, landing in its
+        frame landing_frame at court_point (global ft)."""
+        t = self.frame_times[end].get(landing_frame, fallback_t)
+        self._push(t, 1, end, court_point, landing_frame)
+
+    def _push(self, t, kind, end, court_point, frame_index):
+        import heapq
+
+        # Samples before flags at the same instant: the fusion expects the
+        # ball's latest state before a flag (see add_ground_sample).
+        heapq.heappush(self._pending, (t, kind, self._order, end, court_point, frame_index))
+        self._order += 1
+
+    def _other_at(self, end, t, force):
+        """(ready, court point): the other camera's ball at time t, or None
+        if it had no real detection around then. ready is False while that
+        camera has no frame at or after t yet."""
+        history = self.history["B" if end == "A" else "A"]
+        newest = max((h[-1][0] for h in self.history.values() if h), default=t)
+        if not history or history[-1][0] < t:
+            stalled = not history or history[-1][0] < newest - self.STALE_S
+            return (force or stalled), None
+        if t < history[0][0]:
+            return True, None
+        after = next(i for i, (frame_t, _) in enumerate(history) if frame_t >= t)
+        t1, p1 = history[after]
+        if t1 - t < 1e-4:
+            return True, p1
+        t0, p0 = history[after - 1]
+        if p0 is None or p1 is None or t1 - t0 > self.MAX_BRACKET_S:
+            return True, None
+        w = (t - t0) / (t1 - t0)
+        return True, (p0[0] + w * (p1[0] - p0[0]), p0[1] + w * (p1[1] - p0[1]))
+
+    def flush(self, force=False):
+        """Hand the fusion everything that can be paired now (force: all of
+        it, at the end of a session). Returns the time up to which the
+        fusion has been fed."""
+        import heapq
+
+        while self._pending:
+            t, kind, _, end, court_point, frame_index = self._pending[0]
+            ready, other = self._other_at(end, t, force)
+            if not ready:
+                break
+            heapq.heappop(self._pending)
+            self.emitted_until = max(self.emitted_until, t)
+            if kind == 0:
+                if court_point is None:
+                    self.fusion.add_ground_sample(t, frame_index, None, None)
+                else:
+                    a, b = (court_point, other) if end == "A" else (other, court_point)
+                    self.fusion.add_ground_sample(t, frame_index, a, b)
+            else:
+                self.fusion.add_flag(end, court_point, other, t, frame_index)
+        return self.emitted_until
+
+
 class DualCameraTracker:
     """Tracks with both end cameras at once -- CLAUDE.md's dual end-camera
     build. Each camera gets its own PickleVisionTracker (its own ball lock,
@@ -2370,18 +2719,22 @@ class DualCameraTracker:
     full-court coordinate system (to_global_court_point) and the flags are
     fused into line calls (DualCameraFusion).
 
-    Frames are taken in lockstep, one from each camera per step. From video
-    files that pairs frame N with frame N; from live cameras it's each one's
-    newest frame -- their clocks aren't synced, so a pair can be up to one
-    frame period apart (~8ms at 120fps). Each step runs the two trackers on
+    Frames are taken in time order (_SyncedFrames): live, each camera's
+    newest frame -- their clocks aren't synced, so the two can be up to one
+    frame period apart (~8ms at 120fps); from video files, by the capture
+    times --record-raw saved beside them. Each step runs the two trackers on
     two threads, so one camera's CPU work (filtering, drawing) overlaps the
-    other's GPU work: benchmarked on an RTX 4050 Laptop with rendered 720p
-    footage and GPU torch, 70.5 -> 81.6 pairs/s with the person filter off,
-    38.5 with it on (the default).
+    other's GPU work. The detection model is shared, and the GPU is the
+    limit: two 120fps cameras on an RTX 4050 Laptop (720p, person filter on)
+    run ~90 pairs/s live -- so the detector sees ~3 of every 4 frames and is
+    timed for that (track_processing_rate).
     """
 
     PANEL_HEIGHT = 360
     COURT_VIEW_HEIGHT = 300
+    # The combined view is only built this often unless it's being recorded:
+    # ~3 ms a pair, and the window doesn't need more.
+    DISPLAY_FPS = 30
     CAMERA_COLORS = {"A": (255, 170, 0), "B": (0, 150, 255)}  # BGR: blue, orange
     RECENT_CALLS_SHOWN = 12
 
@@ -2396,6 +2749,7 @@ class DualCameraTracker:
         # tracker's "court" is just its whole frame.
         self.calibrated = tracker_a.court_calibrated and tracker_b.court_calibrated
         self.fusion = DualCameraFusion(court_width, half_length, agreement_ft)
+        self.aligner = CaptureTimeAligner(self.fusion)
         self.pair_index = 0
         self._events_seen = {"A": 0, "B": 0}
 
@@ -2404,29 +2758,33 @@ class DualCameraTracker:
         local = self.trackers[end].court_mapper.map_point(frame_point)
         return to_global_court_point(local, end, self.half_length, self.court_width)
 
-    def _update(self, t):
-        """After both cameras' step: hand any new bounce flags to the fusion.
-        Returns each camera's ball as (court point, is a real detection), or
-        None, for the court view."""
+    def _update(self, captured):
+        """After a step: hand the fusion (through the aligner) each processed
+        camera's ball and any new bounce flags. captured maps each camera
+        processed this step to its frame's capture time. Returns each
+        camera's ball as (court point, is a real detection), or None, for
+        the court view."""
         balls = {}
         for end, tracker in self.trackers.items():
             state = tracker.ball_position()
             balls[end] = None if state is None or not self.calibrated else (self._court_point(end, state[0]), state[1])
-        # Only real detections count as a camera seeing the ball -- a
-        # prediction bridging a gap is a guess, not evidence.
-        detected = {end: ball[0] if ball is not None and ball[1] else None for end, ball in balls.items()}
-        if self.calibrated:
-            self.fusion.add_ground_sample(t, self.pair_index, detected["A"], detected["B"])
-        for end, tracker in self.trackers.items():
+        for end, t in captured.items():
+            tracker = self.trackers[end]
             new_events = tracker.events[self._events_seen[end]:]
             self._events_seen[end] = len(tracker.events)
             if not self.calibrated:
                 continue
+            # Only real detections count as a camera seeing the ball -- a
+            # prediction bridging a gap is a guess, not evidence.
+            ball = balls[end]
+            self.aligner.add_frame(end, tracker.frame_index, t, ball[0] if ball is not None and ball[1] else None)
             for event in new_events:
                 court_point = self._court_point(end, tracker.frame_coords(event.landing_point))
-                self.fusion.add_flag(end, court_point, detected["B" if end == "A" else "A"], t, self.pair_index)
-        for call in self.fusion.close_ready(t):
-            self._print_call(call)
+                landing_frame = event.landing_frame if event.landing_frame is not None else event.frame_index
+                self.aligner.add_flag(end, landing_frame, court_point, t)
+        if self.calibrated:
+            for call in self.fusion.close_ready(self.aligner.flush()):
+                self._print_call(call)
         return balls
 
     @staticmethod
@@ -2529,18 +2887,20 @@ class DualCameraTracker:
         """Track both cameras until either source ends (or fails) or 'q' is
         pressed in the window. Returns the line calls.
 
+        Frames are taken in time order (_SyncedFrames): each step processes
+        the cameras with a new frame -- both, normally, on two threads.
         output_path records the combined view (both feeds + court diagram).
         raw_output_a/raw_output_b record each camera's unannotated frames,
-        written in step, so the pair replays in sync as --source/--source2
-        video files. flips maps "A"/"B" to (horizontal, vertical).
+        written in step (for lag-free footage to replay, use --record-raw).
+        flips maps "A"/"B" to (horizontal, vertical).
         """
         from concurrent.futures import ThreadPoolExecutor
 
         if str(source_a) == str(source_b):
             raise ValueError(f"--source and --source2 are the same ({source_a}) -- dual-camera mode needs two different cameras or videos")
         flips = flips or {}
-        caps, live, readers, writers = {}, {}, {}, {}
-        display = stats = None
+        caps, live, writers, camera_fps, timestamps = {}, {}, {}, {}, {}
+        frames_in = display = stats = None
         executor = ThreadPoolExecutor(max_workers=1)
         t = 0.0
         try:
@@ -2548,12 +2908,24 @@ class DualCameraTracker:
                 tracker = self.trackers[end]
                 caps[end], live[end] = _open_video_source(source, tracker.target_width, tracker.target_height, tracker.target_fps)
                 cap = caps[end]
-                tracker.set_frame_rate(int(cap.get(cv2.CAP_PROP_FPS)) or 30)
+                camera_fps[end] = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+                timestamps[end] = None if live[end] else _load_timestamps(source)
+                delivered = _delivered_fps(timestamps[end]) if timestamps[end] is not None else None
+                note = ""
+                if delivered and abs(delivered - camera_fps[end]) > 0.1 * camera_fps[end]:
+                    note = f" (really delivered {delivered}fps, from its capture times)"
+                    camera_fps[end] = delivered
+                elif timestamps[end] is not None:
+                    note = " (synced by its capture times)"
+                tracker.set_frame_rate(camera_fps[end])
                 print(
                     f"[Camera {end}] {source}: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-                    f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {int(cap.get(cv2.CAP_PROP_FPS)) or 30}fps"
+                    f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {int(cap.get(cv2.CAP_PROP_FPS)) or 30}fps{note}"
                 )
-            fps = min(int(cap.get(cv2.CAP_PROP_FPS)) or 30 for cap in caps.values())
+            if not any(live.values()) and (timestamps["A"] is None) != (timestamps["B"] is None):
+                print("[Dual] Only one of the two videos has capture times -- syncing both by frame number / fps instead")
+                timestamps = {"A": None, "B": None}
+            fps = min(camera_fps.values())
 
             # Same recording rules as run_video: a lower write rate than the
             # capture rate (see its comment on the encode feedback loop), and
@@ -2570,39 +2942,47 @@ class DualCameraTracker:
             max_catchup_frames_per_iteration = max(1, int(record_fps))
 
             stats = _SessionStats(stats_csv) if stats_csv else None
-            for end, cap in caps.items():
-                readers[end] = _FrameReader(cap, live=live[end])
-            # Merge windows need a clock that matches the footage: video files
-            # can be processed faster or slower than they were recorded.
-            frame_clock = not any(live.values())
+            frames_in = _SyncedFrames(caps, live, camera_fps, timestamps)
+            for end in caps:
+                self.trackers[end].async_person_filter = live[end]
+            annotated, raw = {}, {}
+            composed_at = 0.0
 
             while True:
-                frames, arrivals = {}, {}
-                for end, reader in readers.items():
-                    frames[end], arrivals[end] = reader.read()
-                ended = [end for end, frame in frames.items() if frame is None]
-                if ended:
-                    print(f"[Dual] Camera {' and '.join(ended)} stopped delivering frames -- ending the session")
+                new, t_or_ended = frames_in.next()
+                if new is None:
+                    print(f"[Dual] Camera {' and '.join(t_or_ended)} stopped delivering frames -- ending the session")
                     break
+                t = t_or_ended
                 self.pair_index += 1
-                for end in frames:
-                    frames[end] = _flip_frame(frames[end], *flips.get(end, (False, False)))
+                frames = {end: _flip_frame(frame, *flips.get(end, (False, False))) for end, (frame, _, _) in new.items()}
                 # Copied before process_frame draws on the frames (see run_video).
-                raw = {end: frames[end].copy() for end in ("A", "B") if end in outputs}
+                raw.update({end: frames[end].copy() for end in frames if end in outputs})
 
-                future = executor.submit(self.trackers["A"].process_frame, frames["A"])
-                annotated = {"B": self.trackers["B"].process_frame(frames["B"])}
-                annotated["A"] = future.result()
+                if len(frames) == 2:
+                    future = executor.submit(self.trackers["A"].process_frame, frames["A"])
+                    annotated["B"] = self.trackers["B"].process_frame(frames["B"])
+                    annotated["A"] = future.result()
+                else:
+                    for end, frame in frames.items():
+                        annotated[end] = self.trackers[end].process_frame(frame)
+                for end, (_, _, captured) in new.items():
+                    if live[end]:
+                        self.trackers[end].track_processing_rate(captured, camera_fps[end])
 
-                t = self.pair_index / fps if frame_clock else min(arrivals.values())
-                balls = self._update(t)
-                view = self._compose(annotated, balls)
+                balls = self._update({end: captured for end, (_, _, captured) in new.items()})
+                if len(annotated) < 2:
+                    continue  # both cameras' first frames are needed to show anything
+                now = time.perf_counter()
+                view = None
+                if outputs or (show_window and now - composed_at >= 1.0 / self.DISPLAY_FPS):
+                    view, composed_at = self._compose(annotated, balls), now
                 if stats is not None:
-                    # One pair = one "frame" here: fps is pairs per second, and
-                    # latency is from the older of the two frames' arrivals.
-                    stats.frame_done(min(arrivals.values()))
+                    # One step = one "frame" here: fps is steps per second, and
+                    # latency is from the older new frame's arrival.
+                    stats.frame_done(min(arrival for _, arrival, _ in new.values()))
 
-                if outputs:
+                if outputs and all(end in raw for end in ("A", "B") if end in outputs):
                     to_write = {"view": view, **raw}
                     if not writers:
                         for key, path in outputs.items():
@@ -2615,16 +2995,16 @@ class DualCameraTracker:
                             writer.write(to_write[key])
                         frames_written += 1
 
-                if show_window:
+                if show_window and view is not None:
                     if display is None:
                         display = _FrameDisplay("Project PickleVision - Dual Camera", view.shape[1], view.shape[0])
                     display.show(view)
-                    if display.quit_requested.is_set():
-                        break
+                if display is not None and display.quit_requested.is_set():
+                    break
         finally:
             executor.shutdown(wait=True)
-            for reader in readers.values():
-                reader.stop()
+            if frames_in is not None:
+                frames_in.stop()
             for cap in caps.values():
                 cap.release()
             for writer in writers.values():
@@ -2633,6 +3013,8 @@ class DualCameraTracker:
                 display.stop()
             if stats is not None:
                 stats.close()
+            if self.calibrated:
+                self.aligner.flush(force=True)
             for call in self.fusion.close_ready(t, close_all=True):
                 self._print_call(call)
 
@@ -2665,7 +3047,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=720, help="Target camera height in pixels (default: 720; 1080 for 1080p)")
     parser.add_argument("--court-corners", type=str, default=None, help="Court calibration: x1 y1 x2 y2 x3 y3 x4 y4 (TL TR BR BL)")
     parser.add_argument("--view", choices=["end", "side"], default="end", help="Where the camera watches from: 'end' (behind a baseline, the default) or 'side' (beside the court, e.g. level with the net). Calibrate and track with the same value. For one camera, 'side' calls bounces better: in simulation 95%% of landings right vs 85%% from an end (99%% vs 88%% with carefully clicked calibration corners), since from there a bounce always shows as a down-then-up in the image. Single camera only")
-    parser.add_argument("--record-raw", type=str, default=None, metavar="FILE.avi", help="Just record --source's camera, every frame at full rate, nothing else (no detection, no overlays), then exit. Doesn't lag like --raw-output; replay it later with --source FILE.avi")
+    parser.add_argument("--record-raw", type=str, default=None, metavar="FILE.avi", help="Just record --source's camera (and --source2's: FILE_A.avi, FILE_B.avi), every frame at full rate, nothing else (no detection, no overlays), then exit. Saves each frame's capture time beside it (.timestamps.csv) so two cameras replay in sync. Doesn't lag like --raw-output; replay with --source FILE.avi (--source2 FILE_B.avi)")
     parser.add_argument("--record-seconds", type=float, default=None, help="With --record-raw: stop after this many seconds (default: until 'q' or Ctrl+C)")
     parser.add_argument("--list-cameras", action="store_true", help="List the camera indices that open, with the size and real frame rate each delivers at --width/--height/--fps, then exit -- the ELP is the one that keeps up 120fps")
     parser.add_argument("--calibrate-lens", action="store_true", help="Interactively measure the camera lens's fisheye/barrel bend by clicking points along straight court lines, save it (--lens-output), then exit. Use the result with --lens")
@@ -3516,80 +3898,141 @@ def check_dual_camera_alignment(
         cv2.destroyAllWindows()
 
 
-def record_raw(source, path, target_width, target_height, target_fps, show_window=True, seconds=None):
-    """--record-raw: save every frame the camera delivers, and nothing else --
-    footage the tracker can be re-run on later (--source <file>), frame for
-    frame, as many times as needed.
+class _RawRecorder:
+    """One camera of --record-raw: a capture thread reading every frame the
+    camera delivers, stamping its capture time, and a writer thread encoding
+    it (MJPEG .avi) and its time (.timestamps.csv beside it). The queue
+    between them absorbs encoding hiccups, so capture never waits on disk."""
 
-    Recording through run_video (--raw-output) lags: every frame is also
-    detected and re-encoded on the same CPU, and it's frame-paced to the wall
-    clock, so behind schedule it writes duplicate frames. Here nothing else
-    runs: frames go to a queue and a separate thread encodes them as MJPEG
-    (.avi) -- cheap JPEG compression, like the camera's own stream -- so
-    capture never waits on encoding. The preview window repaints ~30x/s.
-    Stops on 'q' in the preview, Ctrl+C, or after `seconds`.
+    def __init__(self, cap, path, fps, start):
+        import queue
+        import threading
+
+        self.cap, self.path, self.start = cap, path, start
+        self.size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self.fps = fps
+        self._writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, self.size)
+        if not self._writer.isOpened():
+            raise SystemExit(f"Couldn't open {path} for writing")
+        self._times = open(_timestamps_path(path), "w")
+        self._times.write("frame,seconds\n")
+        self._queue: "queue.Queue" = queue.Queue(maxsize=fps * 4)  # up to ~4 s of backlog
+        self.latest = None
+        self.captured = self.written = self.dropped = 0
+        self.failed = False
+        self._stopped = threading.Event()
+        self._threads = [threading.Thread(target=self._capture, daemon=True), threading.Thread(target=self._write, daemon=True)]
+        for thread in self._threads:
+            thread.start()
+
+    def _capture(self):
+        import queue
+
+        while not self._stopped.is_set():
+            try:
+                ok, frame = self.cap.read()
+            except cv2.error:
+                ok = False
+            if not ok:
+                self.failed = True
+                break
+            stamp = time.perf_counter() - self.start
+            self.captured += 1
+            self.latest = frame
+            try:
+                self._queue.put_nowait((frame, stamp))
+            except queue.Full:
+                self.dropped += 1  # encoding fell ~4 s behind; keep capturing live
+        self._queue.put(None)
+
+    def _write(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            frame, stamp = item
+            self._writer.write(frame)
+            self._times.write(f"{self.written},{stamp:.6f}\n")
+            self.written += 1
+
+    def stop(self):
+        self._stopped.set()
+        for thread in self._threads:
+            thread.join()
+        self._writer.release()
+        self._times.close()
+        self.cap.release()
+
+
+def record_raw(sources, path, target_width, target_height, target_fps, show_window=True, seconds=None):
+    """--record-raw: save every frame the camera(s) deliver, and nothing else
+    -- footage the tracker can be re-run on later (--source <file>, and
+    --source2 for the second camera's), as many times as needed.
+
+    Recording through the tracker (--raw-output) lags: every frame is also
+    detected and re-encoded on the same machine, and it's frame-paced to the
+    wall clock, so behind schedule it writes duplicate frames. Here nothing
+    else runs (see _RawRecorder). Each video gets its frames' capture times
+    beside it (.timestamps.csv): the tracker replays two cameras' videos in
+    sync by those (_SyncedFrames), and times detection to the rate the camera
+    really delivered. sources is a list of one or two cameras; with two, path
+    raw1.avi saves raw1_A.avi and raw1_B.avi. Stops on 'q' in the preview,
+    Ctrl+C, or after `seconds`.
     """
-    import queue
-
     path = Path(path)
     if path.suffix.lower() != ".avi":
         path = path.with_suffix(".avi")
         print(f"[Record] MJPEG needs an .avi file -- saving to {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    cap, _ = _open_video_source(source, target_width, target_height, target_fps)
-    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
-    if not writer.isOpened():
-        cap.release()
-        raise SystemExit(f"Couldn't open {path} for writing")
-    frames: "queue.Queue" = queue.Queue(maxsize=fps * 4)  # up to ~4 s of backlog
-    written, dropped = [0], [0]
-
-    def write_frames():
-        while True:
-            frame = frames.get()
-            if frame is None:
-                return
-            writer.write(frame)
-            written[0] += 1
-
-    writer_thread = threading.Thread(target=write_frames, daemon=True)
-    writer_thread.start()
-    display = _FrameDisplay(f"Recording {path.name} -- 'q' to stop", min(width, 1280), min(height, 720), max_fps=30) if show_window else None
-    print(f"[Record] {width}x{height} @ {fps}fps -> {path} ('q' in the preview or Ctrl+C to stop)")
-    captured, start = 0, time.perf_counter()
+    ends = ["A", "B"][: len(sources)]
+    paths = {end: path.with_name(f"{path.stem}_{end}.avi") if len(sources) > 1 else path for end in ends}
+    caps = {}
+    try:
+        for end, source in zip(ends, sources):
+            caps[end], _ = _open_video_source(source, target_width, target_height, target_fps)
+    except Exception:
+        for cap in caps.values():
+            cap.release()
+        raise
+    start = time.perf_counter()
+    recorders = {end: _RawRecorder(caps[end], paths[end], int(caps[end].get(cv2.CAP_PROP_FPS)) or 30, start) for end in ends}
+    for end, source in zip(ends, sources):
+        rec = recorders[end]
+        label = f"Camera {end} ({source})" if len(sources) > 1 else f"Camera {source}"
+        print(f"[Record] {label}: {rec.size[0]}x{rec.size[1]} @ {rec.fps}fps -> {rec.path}")
+    print("[Record] Recording -- 'q' in the preview or Ctrl+C to stop")
+    display = None
+    if show_window:
+        width = 1280 if len(sources) > 1 else min(recorders["A"].size[0], 1280)
+        display = _FrameDisplay("Recording -- 'q' to stop", width, 360 if len(sources) > 1 else 720, max_fps=30)
     try:
         while seconds is None or time.perf_counter() - start < seconds:
-            try:
-                ok, frame = cap.read()
-            except cv2.error:
-                ok = False
-            if not ok:
-                print("[Record] The camera stopped delivering frames.")
+            if any(rec.failed for rec in recorders.values()):
+                print("[Record] " + ", ".join(f"camera {end}" for end, rec in recorders.items() if rec.failed) + " stopped delivering frames.")
                 break
-            captured += 1
-            try:
-                frames.put_nowait(frame)
-            except queue.Full:
-                dropped[0] += 1  # encoding fell ~4 s behind; keep capturing live
             if display is not None:
-                display.show(frame)
+                latest = [rec.latest for rec in recorders.values()]
+                if all(frame is not None for frame in latest):
+                    display.show(np.hstack([cv2.resize(frame, (640, 360)) for frame in latest]) if len(latest) > 1 else latest[0])
                 if display.quit_requested.is_set():
                     break
+            time.sleep(1 / 30)
     except KeyboardInterrupt:
         pass
     finally:
         elapsed = time.perf_counter() - start
-        frames.put(None)
-        writer_thread.join()
-        writer.release()
-        cap.release()
+        for rec in recorders.values():
+            rec.stop()
         if display is not None:
             display.stop()
-    print(f"[Record] {captured} frames in {elapsed:.1f}s ({captured / max(elapsed, 1e-9):.0f} fps delivered), "
-          f"{written[0]} saved, {dropped[0]} dropped -> {path}")
-    print(f"[Record] Track it later with: --source \"{path}\"")
+    for end, rec in recorders.items():
+        label = f"Camera {end}" if len(sources) > 1 else "Camera"
+        print(f"[Record] {label}: {rec.captured} frames in {elapsed:.1f}s ({rec.captured / max(elapsed, 1e-9):.0f} fps delivered), "
+              f"{rec.written} saved, {rec.dropped} dropped -> {rec.path}")
+    if len(sources) > 1:
+        print(f"[Record] Track them later with: --source \"{paths['A']}\" --source2 \"{paths['B']}\"")
+    else:
+        print(f"[Record] Track it later with: --source \"{path}\"")
 
 
 def list_cameras(target_width, target_height, target_fps, max_index=6):
@@ -3695,7 +4138,7 @@ def _build_tracker(args, court_corners, camera_id="cam0", shared_roboflow_model=
     )
 
 
-def _warm_up(tracker, args):
+def _warm_up(tracker, args, *others):
     print(f"[Device] Running inference on: {tracker.device}")
     if tracker.roboflow_local_model is not None:
         # Warm up here so the one-time TensorRT engine build (or CUDA init)
@@ -3703,6 +4146,11 @@ def _warm_up(tracker, args):
         # the first live frame.
         tracker.roboflow_local_model.infer(np.zeros((args.height, args.width, 3), np.uint8))
         print(f"[Device] Model backend: {tracker.roboflow_local_model.onnx_session.get_providers()[0]}")
+    for each in (tracker, *others):
+        if each.person_model is not None:
+            # Its first call sets up CUDA kernels (~1 s): otherwise the first
+            # second of tracking runs at a third of its speed.
+            each._find_people(np.zeros((args.height, args.width, 3), np.uint8))
 
 
 def _run_dual_camera(args, source):
@@ -3725,7 +4173,7 @@ def _run_dual_camera(args, source):
         shared_roboflow_model=tracker_a.roboflow_local_model,
         lens=_load_lens(args.lens2, args, "--lens2"),
     )
-    _warm_up(tracker_a, args)
+    _warm_up(tracker_a, args, tracker_b)
 
     dual = DualCameraTracker(
         tracker_a, tracker_b, court_width=args.court_width, half_length=args.court_length, agreement_ft=args.bounce_agreement_ft
@@ -3768,7 +4216,8 @@ def main():
         source = int(source)
 
     if args.record_raw:
-        record_raw(source, args.record_raw, args.width, args.height, args.fps, show_window=args.show, seconds=args.record_seconds)
+        sources = [source] if args.source2 is None else [source, int(args.source2) if str(args.source2).isdigit() else args.source2]
+        record_raw(sources, args.record_raw, args.width, args.height, args.fps, show_window=args.show, seconds=args.record_seconds)
         return
 
     if args.list_cameras:
