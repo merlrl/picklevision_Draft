@@ -883,6 +883,9 @@ class PickleVisionTracker:
         # Prepended to this tracker's console messages -- DualCameraTracker
         # sets it per camera, so each line says which camera it's about.
         self.log_prefix = ""
+        # See _plausible_landing: with a half-court calibration, ignore
+        # landings past the net. DualCameraTracker turns it off.
+        self.half_court_only = True
 
         # "Digital zoom": crop detection/display to the calibrated court region so
         # the same imgsz budget is spent entirely on the area that matters, instead
@@ -1132,15 +1135,27 @@ class PickleVisionTracker:
         """False for a "landing" mapping more than LANDING_MARGIN_FT outside
         the calibrated court: a V the ball made high in the air (e.g. a lob
         dropping onto a paddle), whose line of sight meets the ground far
-        away. Always True uncalibrated, where there's no court to compare."""
+        away. Always True uncalibrated, where there's no court to compare.
+
+        With a half-court calibration (an end camera, net = the TOP edge) a
+        single camera also doesn't call anything past the net: that half isn't
+        its to call, and a ball in the air above it maps farther still. On real
+        footage (ELP behind a baseline, near half calibrated) most wrong OUT
+        calls were exactly this -- "-8 to -134 ft from the net". Dual-camera
+        mode clears half_court_only: the other end camera covers that half.
+        """
         if not self.court_calibrated:
             return True
         x, y = self.court_mapper.map_point(self.frame_coords(point))
         dst = self.court_mapper.dst_points
         margin = self.LANDING_MARGIN_FT
+        y_min = float(np.min(dst[:, 1]))
+        half_court = self.court_mapper.view == "end" and abs(self.court_mapper.court_length - 44.0) >= 1.0
+        if half_court and self.half_court_only and y < y_min:
+            return False
         return (
             float(np.min(dst[:, 0])) - margin <= x <= float(np.max(dst[:, 0])) + margin
-            and float(np.min(dst[:, 1])) - margin <= y <= float(np.max(dst[:, 1])) + margin
+            and y_min - margin <= y <= float(np.max(dst[:, 1])) + margin
         )
 
     def _court_position(self, point):
@@ -2374,6 +2389,7 @@ class DualCameraTracker:
         self.trackers = {"A": tracker_a, "B": tracker_b}
         for end, tracker in self.trackers.items():
             tracker.log_prefix = f"[Cam {end}] "
+            tracker.half_court_only = False
         self.court_width = court_width
         self.half_length = half_length
         # Court positions need both cameras calibrated -- an uncalibrated
@@ -2649,6 +2665,8 @@ def parse_args():
     parser.add_argument("--height", type=int, default=720, help="Target camera height in pixels (default: 720; 1080 for 1080p)")
     parser.add_argument("--court-corners", type=str, default=None, help="Court calibration: x1 y1 x2 y2 x3 y3 x4 y4 (TL TR BR BL)")
     parser.add_argument("--view", choices=["end", "side"], default="end", help="Where the camera watches from: 'end' (behind a baseline, the default) or 'side' (beside the court, e.g. level with the net). Calibrate and track with the same value. For one camera, 'side' calls bounces better: in simulation 95%% of landings right vs 85%% from an end (99%% vs 88%% with carefully clicked calibration corners), since from there a bounce always shows as a down-then-up in the image. Single camera only")
+    parser.add_argument("--record-raw", type=str, default=None, metavar="FILE.avi", help="Just record --source's camera, every frame at full rate, nothing else (no detection, no overlays), then exit. Doesn't lag like --raw-output; replay it later with --source FILE.avi")
+    parser.add_argument("--record-seconds", type=float, default=None, help="With --record-raw: stop after this many seconds (default: until 'q' or Ctrl+C)")
     parser.add_argument("--list-cameras", action="store_true", help="List the camera indices that open, with the size and real frame rate each delivers at --width/--height/--fps, then exit -- the ELP is the one that keeps up 120fps")
     parser.add_argument("--calibrate-lens", action="store_true", help="Interactively measure the camera lens's fisheye/barrel bend by clicking points along straight court lines, save it (--lens-output), then exit. Use the result with --lens")
     parser.add_argument("--lens-output", type=str, default=None, help="Where --calibrate-lens saves the lens file (default: lens_cam<source>.json)")
@@ -3498,6 +3516,82 @@ def check_dual_camera_alignment(
         cv2.destroyAllWindows()
 
 
+def record_raw(source, path, target_width, target_height, target_fps, show_window=True, seconds=None):
+    """--record-raw: save every frame the camera delivers, and nothing else --
+    footage the tracker can be re-run on later (--source <file>), frame for
+    frame, as many times as needed.
+
+    Recording through run_video (--raw-output) lags: every frame is also
+    detected and re-encoded on the same CPU, and it's frame-paced to the wall
+    clock, so behind schedule it writes duplicate frames. Here nothing else
+    runs: frames go to a queue and a separate thread encodes them as MJPEG
+    (.avi) -- cheap JPEG compression, like the camera's own stream -- so
+    capture never waits on encoding. The preview window repaints ~30x/s.
+    Stops on 'q' in the preview, Ctrl+C, or after `seconds`.
+    """
+    import queue
+
+    path = Path(path)
+    if path.suffix.lower() != ".avi":
+        path = path.with_suffix(".avi")
+        print(f"[Record] MJPEG needs an .avi file -- saving to {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cap, _ = _open_video_source(source, target_width, target_height, target_fps)
+    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise SystemExit(f"Couldn't open {path} for writing")
+    frames: "queue.Queue" = queue.Queue(maxsize=fps * 4)  # up to ~4 s of backlog
+    written, dropped = [0], [0]
+
+    def write_frames():
+        while True:
+            frame = frames.get()
+            if frame is None:
+                return
+            writer.write(frame)
+            written[0] += 1
+
+    writer_thread = threading.Thread(target=write_frames, daemon=True)
+    writer_thread.start()
+    display = _FrameDisplay(f"Recording {path.name} -- 'q' to stop", min(width, 1280), min(height, 720), max_fps=30) if show_window else None
+    print(f"[Record] {width}x{height} @ {fps}fps -> {path} ('q' in the preview or Ctrl+C to stop)")
+    captured, start = 0, time.perf_counter()
+    try:
+        while seconds is None or time.perf_counter() - start < seconds:
+            try:
+                ok, frame = cap.read()
+            except cv2.error:
+                ok = False
+            if not ok:
+                print("[Record] The camera stopped delivering frames.")
+                break
+            captured += 1
+            try:
+                frames.put_nowait(frame)
+            except queue.Full:
+                dropped[0] += 1  # encoding fell ~4 s behind; keep capturing live
+            if display is not None:
+                display.show(frame)
+                if display.quit_requested.is_set():
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        elapsed = time.perf_counter() - start
+        frames.put(None)
+        writer_thread.join()
+        writer.release()
+        cap.release()
+        if display is not None:
+            display.stop()
+    print(f"[Record] {captured} frames in {elapsed:.1f}s ({captured / max(elapsed, 1e-9):.0f} fps delivered), "
+          f"{written[0]} saved, {dropped[0]} dropped -> {path}")
+    print(f"[Record] Track it later with: --source \"{path}\"")
+
+
 def list_cameras(target_width, target_height, target_fps, max_index=6):
     """--list-cameras: each camera index that opens, with the size it gives
     and the frame rate it really delivers at the requested mode (measured,
@@ -3672,6 +3766,10 @@ def main():
     source = args.source
     if isinstance(source, str) and source.isdigit():
         source = int(source)
+
+    if args.record_raw:
+        record_raw(source, args.record_raw, args.width, args.height, args.fps, show_window=args.show, seconds=args.record_seconds)
+        return
 
     if args.list_cameras:
         list_cameras(args.width, args.height, args.fps)
