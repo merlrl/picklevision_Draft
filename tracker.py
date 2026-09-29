@@ -431,6 +431,61 @@ class _FrameDisplay:
         self._thread.join(timeout=2.0)
 
 
+class _BackgroundVideoWriter:
+    """cv2.VideoWriter on its own thread, for recording the tracker's view
+    (--output, --raw-output) while it tracks.
+
+    Encoding on the tracking loop is what made recording inside the tracker
+    lag (on Franz's laptop, bad enough to fall back to screen recording):
+    each frame waited for the encoder, and the combined dual-camera view
+    (2560x1320) takes tens of ms to encode. Here write() only queues the
+    frame; the thread encodes it. `copies` writes a frame more than once --
+    the loop's frame pacing, so the video plays at real speed however fast
+    tracking runs. If encoding falls ~2 s behind, frames are dropped (and
+    counted) rather than slowing tracking down.
+    """
+
+    def __init__(self, path, fps, size, fourcc="mp4v"):
+        import queue
+        import threading
+
+        self.path = Path(path)
+        self._writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*fourcc), fps, size)
+        if not self._writer.isOpened():
+            raise SystemExit(f"Couldn't open {path} for writing")
+        self._queue: "queue.Queue" = queue.Queue(maxsize=max(4, int(2 * fps)))
+        self.written = self.dropped = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def write(self, frame, copies=1):
+        """Queue `frame` to be written `copies` times. The caller must not
+        draw on it afterwards."""
+        import queue
+
+        try:
+            self._queue.put_nowait((frame, copies))
+        except queue.Full:
+            self.dropped += copies
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            frame, copies = item
+            for _ in range(copies):
+                self._writer.write(frame)
+            self.written += copies
+
+    def release(self):
+        self._queue.put(None)
+        self._thread.join()
+        self._writer.release()
+        dropped = f", {self.dropped} dropped (encoding fell behind)" if self.dropped else ""
+        print(f"[Recording] {self.written} frames saved{dropped} -> {self.path}")
+
+
 class _SessionStats:
     """--stats: performance and resource log for one tracking session.
 
@@ -1506,6 +1561,56 @@ class PickleVisionTracker:
                 return True
         return False
 
+    def _snap_to_ball(self, frame, box):
+        """The whole ball's box, when `box` is only part of it.
+
+        Up close a pickleball is big enough that the model finds its holes --
+        each a small round thing with a ball-colored rim, so shape and color
+        both pass -- and a box on a hole puts the ball's center and bottom
+        (its landing point) in the wrong place. Around the box, the
+        ball-colored region's outer outline is the whole ball (the holes are
+        inside it). If that outline contains the box's center and is a round
+        blob clearly bigger than the box, its bounding box is used instead.
+        A box already on the whole ball (the usual case on court, the ball a
+        few pixels across) finds nothing bigger and is kept.
+        """
+        if not self.require_ball_color:
+            return box
+        x1, y1, x2, y2 = box
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        size = max(x2 - x1, y2 - y1)
+        # A pickleball is ~8 hole-widths across, and from a hole at its rim
+        # the far side is that far away: look 9 box-widths out.
+        reach = min(max(9 * size, 40), 400)
+        wx1, wy1 = max(int(cx - reach), 0), max(int(cy - reach), 0)
+        wx2, wy2 = min(int(cx + reach), frame.shape[1]), min(int(cy + reach), frame.shape[0])
+        if wx2 - wx1 < 4 or wy2 - wy1 < 4:
+            return box
+        # Blurred, and specks removed: with sensor noise, stray background
+        # pixels in the ball's color otherwise link it to its surroundings.
+        hsv = cv2.cvtColor(cv2.GaussianBlur(frame[wy1:wy2, wx1:wx2], (5, 5), 0), cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.ball_color_lower, self.ball_color_upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        # Bridge holes that break the ball's outline at its edge.
+        kernel = max(3, int(size / 2) | 1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel, kernel)))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return box
+        # The blob the box's center is in -- or, for a hole at the ball's
+        # rim, whose thin edge can break into a notch, just outside of: within
+        # one box-width.
+        center = (float(cx - wx1), float(cy - wy1))
+        depth, contour = max(((cv2.pointPolygonTest(c, center, True), c) for c in contours), key=lambda pair: pair[0])
+        if depth < -size:
+            return box
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        touches_edge = bx == 0 or by == 0 or bx + bw >= wx2 - wx1 or by + bh >= wy2 - wy1
+        round_blob = min(bw, bh) / max(bw, bh) >= 0.7 and cv2.contourArea(contour) >= 0.55 * bw * bh
+        if not touches_edge and round_blob and bw * bh >= 2.0 * (x2 - x1) * (y2 - y1):
+            return (float(wx1 + bx), float(wy1 + by), float(wx1 + bx + bw), float(wy1 + by + bh))
+        return box
+
     def _is_plausible_ball_shape(self, box):
         """Reject boxes too small or too non-square to plausibly be a round ball.
 
@@ -2105,7 +2210,7 @@ class PickleVisionTracker:
         box, track_id = selection
         self.primary_track_id = track_id
         self.missed_frames = 0
-        self._draw_primary_tracking(detect_frame, box, predicted=False)
+        self._draw_primary_tracking(detect_frame, self._snap_to_ball(detect_frame, box), predicted=False)
         return detect_frame
 
     def _process_frame_ultralytics(self, detect_frame):
@@ -2147,7 +2252,7 @@ class PickleVisionTracker:
             box, track_id = selection
             self.primary_track_id = track_id
             self.missed_frames = 0
-            self._draw_primary_tracking(detect_frame, box, predicted=False)
+            self._draw_primary_tracking(detect_frame, self._snap_to_ball(detect_frame, box), predicted=False)
             return detect_frame
 
         filtered_boxes = result.boxes.xyxy.cpu().numpy()
@@ -2222,7 +2327,9 @@ class PickleVisionTracker:
         # ceiling). The Roboflow backend defaults much lower than the local
         # Ultralytics one for exactly this reason -- every frame is still
         # detected on either way, just not every one written to the file.
-        default_record_fps = 10 if self.use_roboflow else 30
+        # (Encoding now also runs on its own thread, _BackgroundVideoWriter;
+        # the local Roboflow model is fast enough for 30.)
+        default_record_fps = 10 if self.device == "roboflow-server" else 30
         effective_record_fps = record_fps if record_fps else min(fps, default_record_fps)
         if (output_path or raw_output_path) and effective_record_fps < fps:
             print(f"[Recording] Capturing/detecting at {fps}fps, writing video at {effective_record_fps}fps")
@@ -2240,12 +2347,7 @@ class PickleVisionTracker:
         if output_path:
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            writer = cv2.VideoWriter(
-                str(output_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                effective_record_fps,
-                (output_width, output_height),
-            )
+            writer = _BackgroundVideoWriter(output_path, effective_record_fps, (output_width, output_height))
 
         # Separate from `writer`: saves the frame BEFORE any boxes/labels/trajectory
         # lines are drawn on it, so this file is safe to upload to Roboflow for
@@ -2255,12 +2357,7 @@ class PickleVisionTracker:
         if raw_output_path:
             raw_output_path = Path(raw_output_path)
             raw_output_path.parent.mkdir(parents=True, exist_ok=True)
-            raw_writer = cv2.VideoWriter(
-                str(raw_output_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                effective_record_fps,
-                (width, height),
-            )
+            raw_writer = _BackgroundVideoWriter(raw_output_path, effective_record_fps, (width, height))
             print(f"[Raw Recording] Saving unannotated footage to {raw_output_path} (Roboflow-ready)")
 
         display = None
@@ -2281,7 +2378,7 @@ class PickleVisionTracker:
         # Capped per-iteration, or falling far enough behind (e.g. the requested fps
         # is unrealistic for this camera/hardware) turns into a write-storm that
         # falls further behind with every duplicate write, freezing the app.
-        record_start = time.time()
+        record_start = time.perf_counter()
         frames_written = 0
         max_catchup_frames_per_iteration = max(1, int(effective_record_fps))
 
@@ -2316,14 +2413,18 @@ class PickleVisionTracker:
                     print(f"[Call] {self.last_call['call']} -- court position x={x_ft:.1f} ft, y={y_ft:.1f} ft (frame {self.last_call['frame_index']})")
 
                 if writer is not None or raw_writer is not None:
-                    expected_frames = int((time.time() - record_start) * effective_record_fps)
-                    catchup_target = min(expected_frames, frames_written + max_catchup_frames_per_iteration)
-                    while frames_written <= catchup_target:
+                    due = min(
+                        int((time.perf_counter() - record_start) * effective_record_fps) + 1 - frames_written,
+                        max_catchup_frames_per_iteration,
+                    )
+                    if due > 0:
+                        # Queued without copying: both are new arrays every frame,
+                        # and nothing draws on them after this.
                         if writer is not None:
-                            writer.write(annotated)
+                            writer.write(annotated, copies=due)
                         if raw_writer is not None:
-                            raw_writer.write(raw_frame)
-                        frames_written += 1
+                            raw_writer.write(raw_frame, copies=due)
+                        frames_written += due
 
                 if display is not None:
                     display.show(annotated)
@@ -2730,8 +2831,7 @@ class DualCameraTracker:
     timed for that (track_processing_rate).
     """
 
-    PANEL_HEIGHT = 360
-    COURT_VIEW_HEIGHT = 300
+    COURT_VIEW_HEIGHT = 300  # at a 360-pixel-high feed; scaled with the feeds (see _compose)
     # The combined view is only built this often unless it's being recorded:
     # ~3 ms a pair, and the window doesn't need more.
     DISPLAY_FPS = 30
@@ -2800,26 +2900,31 @@ class DualCameraTracker:
             print(f"[Call] {call.call} at {where} -- camera {call.source_camera} only (the other camera didn't have the ball)")
 
     def _compose(self, annotated, balls):
-        """Both annotated feeds side by side, over a top-down court diagram."""
+        """Both annotated feeds side by side, over a top-down court diagram.
+        The feeds keep the cameras' own resolution (the smaller one's height,
+        if they differ) -- shrinking them to fit a laptop screen here made
+        the window blurry once maximized; the window scales it instead."""
+        panel_height = min(frame.shape[0] for frame in annotated.values())
+        ui = panel_height / 360  # text and marks were sized for 360-pixel-high panels
         panels = []
         for end in ("A", "B"):
             frame = annotated[end]
             height, width = frame.shape[:2]
-            panel = cv2.resize(frame, (max(1, round(width * self.PANEL_HEIGHT / height)), self.PANEL_HEIGHT))
+            panels.append(frame if height == panel_height else cv2.resize(frame, (max(1, round(width * panel_height / height)), panel_height)))
+        top = np.hstack(panels)  # a copy: labels drawn on it don't touch the trackers' frames
+        for end, x in (("A", 0), ("B", panels[0].shape[1])):
             state = self.trackers[end].ball_position()
             label = f"Camera {end}: " + ("no ball" if state is None else ("ball" if state[1] else "ball (predicted)"))
-            _draw_label(panel, label, (10, 26), self.CAMERA_COLORS[end])
-            panels.append(panel)
-        top = np.hstack(panels)
-        return np.vstack([top, self._draw_court_view(top.shape[1], balls)])
+            _draw_label(top, label, (x + round(10 * ui), round(26 * ui)), self.CAMERA_COLORS[end], scale=0.6 * ui, thickness=max(2, round(2 * ui)))
+        return np.vstack([top, self._draw_court_view(top.shape[1], balls, ui)])
 
-    def _draw_court_view(self, width, balls):
+    def _draw_court_view(self, width, balls, ui=1.0):
         """Top-down diagram of the full court -- end A on the left, end B on
         the right -- with each camera's ball (filled = detected, ring =
-        predicted) and the recent line calls."""
-        height = self.COURT_VIEW_HEIGHT
+        predicted) and the recent line calls. ui scales text and marks."""
+        height = round(self.COURT_VIEW_HEIGHT * ui)
         view = np.full((height, width, 3), 32, np.uint8)
-        text_area = 48
+        text_area = round(48 * ui)
         length = 2 * self.half_length
         # Run-off shown past the baselines/sidelines (ft), so OUT calls stay on screen.
         run_off_y, run_off_x = 6.0, 4.0
@@ -2834,6 +2939,10 @@ class DualCameraTracker:
         def on_view(p):
             return 0 <= p[0] < width and 0 <= p[1] < height - text_area
 
+        def size(value):
+            return max(1, round(value * ui))
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
         w, net, kitchen = self.court_width, self.half_length, 7.0
         white = (235, 235, 235)
         cv2.rectangle(view, px((0, 0)), px((w, length)), (100, 65, 30), -1)
@@ -2843,21 +2952,21 @@ class DualCameraTracker:
             ((0, net - kitchen), (w, net - kitchen)), ((0, net + kitchen), (w, net + kitchen)),  # kitchen lines
             ((w / 2, 0), (w / 2, net - kitchen)), ((w / 2, net + kitchen), (w / 2, length)),  # centerlines
         ):
-            cv2.line(view, px(a), px(b), white, 1)
-        cv2.line(view, px((-1, net)), px((w + 1, net)), (190, 190, 190), 3)  # net, posts just outside the sidelines
+            cv2.line(view, px(a), px(b), white, size(1), cv2.LINE_AA)
+        cv2.line(view, px((-1, net)), px((w + 1, net)), (190, 190, 190), size(3))  # net, posts just outside the sidelines
         # Out at the edge of the run-off, clear of calls just past the baselines.
         for end, y in (("A", 1.0 - run_off_y), ("B", length + run_off_y - 1.0)):
             label_x, label_y = px((w / 2, y))
-            cv2.putText(view, end, (label_x - 6, label_y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.CAMERA_COLORS[end], 2)
+            cv2.putText(view, end, (label_x - size(6), label_y + size(6)), font, 0.7 * ui, self.CAMERA_COLORS[end], size(2), cv2.LINE_AA)
 
         for call in self.fusion.calls[-self.RECENT_CALLS_SHOWN:]:
             p = px(call.court_point)
             if on_view(p):
                 color = (0, 200, 0) if call.call == "IN" else (0, 0, 255)
-                cv2.circle(view, p, 6, color, -1 if call.status == "CONFIRMED" else 2)
+                cv2.circle(view, p, size(6), color, -1 if call.status == "CONFIRMED" else size(2), cv2.LINE_AA)
         for end, ball in balls.items():
             if ball is not None and on_view(px(ball[0])):
-                cv2.circle(view, px(ball[0]), 4, self.CAMERA_COLORS[end], -1 if ball[1] else 1)
+                cv2.circle(view, px(ball[0]), size(4), self.CAMERA_COLORS[end], -1 if ball[1] else size(1), cv2.LINE_AA)
 
         if not self.calibrated:
             status = "Not calibrated: --calibrate --court-length 22 each camera, then pass --court-corners / --court-corners2"
@@ -2867,18 +2976,19 @@ class DualCameraTracker:
             status = f"Last call: {last.call} at ({last.court_point[0]:.1f}, {last.court_point[1]:.1f}) ft -- {how}"
             p = px(last.court_point)
             if on_view(p):
-                cv2.putText(view, last.call, (p[0] + 8, p[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 1)
+                cv2.putText(view, last.call, (p[0] + size(8), p[1] - size(8)), font, 0.5 * ui, white, size(1), cv2.LINE_AA)
         else:
             status = "Waiting for the first bounce"
-        cv2.putText(view, status, (10, height - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 1)
+        cv2.putText(view, status, (size(10), height - size(28)), font, 0.5 * ui, white, size(1), cv2.LINE_AA)
         cv2.putText(
             view,
             "calls: filled = both cameras agree, ring = one camera only | small dots = each camera's ball (ring = predicted)",
-            (10, height - 9),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
+            (size(10), height - size(9)),
+            font,
+            0.4 * ui,
             (170, 170, 170),
-            1,
+            size(1),
+            cv2.LINE_AA,
         )
         return view
 
@@ -2928,16 +3038,16 @@ class DualCameraTracker:
             fps = min(camera_fps.values())
 
             # Same recording rules as run_video: a lower write rate than the
-            # capture rate (see its comment on the encode feedback loop), and
-            # frame-paced to wall-clock time so recordings play at real speed.
-            default_record_fps = 10 if self.trackers["A"].use_roboflow else 30
+            # capture rate, frame-paced to wall-clock time so recordings play
+            # at real speed, encoded on a background thread.
+            default_record_fps = 10 if self.trackers["A"].device == "roboflow-server" else 30
             record_fps = record_fps if record_fps else min(fps, default_record_fps)
             outputs = {key: Path(path) for key, path in (("view", output_path), ("A", raw_output_a), ("B", raw_output_b)) if path}
             for path in outputs.values():
                 path.parent.mkdir(parents=True, exist_ok=True)
             if outputs and record_fps < fps:
                 print(f"[Recording] Capturing/detecting at {fps}fps, writing video at {record_fps}fps")
-            record_start = time.time()
+            record_start = time.perf_counter()
             frames_written = 0
             max_catchup_frames_per_iteration = max(1, int(record_fps))
 
@@ -2974,30 +3084,40 @@ class DualCameraTracker:
                 if len(annotated) < 2:
                     continue  # both cameras' first frames are needed to show anything
                 now = time.perf_counter()
+                # Recorded frames are due at record_fps of wall-clock time (a
+                # step can owe several, written as copies, if it ran long).
+                record_due = 0
+                if outputs and all(end in raw for end in ("A", "B") if end in outputs):
+                    record_due = min(int((now - record_start) * record_fps) + 1 - frames_written, max_catchup_frames_per_iteration)
                 view = None
-                if outputs or (show_window and now - composed_at >= 1.0 / self.DISPLAY_FPS):
+                if (record_due > 0 and "view" in outputs) or (show_window and now - composed_at >= 1.0 / self.DISPLAY_FPS):
                     view, composed_at = self._compose(annotated, balls), now
                 if stats is not None:
                     # One step = one "frame" here: fps is steps per second, and
                     # latency is from the older new frame's arrival.
                     stats.frame_done(min(arrival for _, arrival, _ in new.values()))
 
-                if outputs and all(end in raw for end in ("A", "B") if end in outputs):
+                if record_due > 0:
                     to_write = {"view": view, **raw}
                     if not writers:
                         for key, path in outputs.items():
                             size = (to_write[key].shape[1], to_write[key].shape[0])
-                            writers[key] = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), record_fps, size)
-                    expected_frames = int((time.time() - record_start) * record_fps)
-                    catchup_target = min(expected_frames, frames_written + max_catchup_frames_per_iteration)
-                    while frames_written <= catchup_target:
-                        for key, writer in writers.items():
-                            writer.write(to_write[key])
-                        frames_written += 1
+                            writers[key] = _BackgroundVideoWriter(path, record_fps, size)
+                        print(f"[Recording] Writing at {record_fps}fps: " + ", ".join(str(path) for path in outputs.values()))
+                    # Safe to queue without copying: each step's frames, raw copies
+                    # and composed view are new arrays, never drawn on again.
+                    for key, writer in writers.items():
+                        writer.write(to_write[key], copies=record_due)
+                    frames_written += record_due
 
                 if show_window and view is not None:
                     if display is None:
-                        display = _FrameDisplay("Project PickleVision - Dual Camera", view.shape[1], view.shape[0])
+                        # Opens at a size that fits a laptop screen; maximize it for
+                        # the full resolution.
+                        window_width = min(view.shape[1], 1600)
+                        display = _FrameDisplay(
+                            "Project PickleVision - Dual Camera", window_width, round(view.shape[0] * window_width / view.shape[1])
+                        )
                     display.show(view)
                 if display is not None and display.quit_requested.is_set():
                     break
